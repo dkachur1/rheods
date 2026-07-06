@@ -88,6 +88,40 @@ hot/small streams this is plausibly comparable-or-better; on a huge stream with
 one key sparse across thousands of *cold* segments, Prisma's segment index
 likely wins until `crates/ds-index` is wired in (see `bench/README.md`).
 
+### Base path (no keying): native Rust vs interpreted JS
+
+Stripped of keying — plain append + plain read on the same data — the case for
+this server being faster than Prisma's Bun server is much stronger than for the
+keyed path, for two reasons:
+
+1. **The keying patches don't touch the unkeyed path.** An append with no
+   `Stream-Key` does zero extra work; an unkeyed read is byte-for-byte the
+   original code. So the base-path performance *is* the upstream "kernel-speed"
+   Rust server's, unchanged — `sendfile`/`splice` zero-copy reads,
+   wire-format-on-disk.
+2. **Native Rust vs interpreted JS.** Prisma's server is TypeScript on the Bun
+   runtime (JIT'd, GC'd) — a different tier for raw throughput and memory than
+   a native, zero-copy server.
+
+The closest apples-to-apples proxy is the [ds-bench](https://github.com/electric-sql/ds-bench)
+run (same hardware), comparing the Rust server against the **Node.js** reference
+(a JS server):
+
+| same hardware (ds-bench) | Rust base server | Node.js reference (JS) |
+|---|---|---|
+| append throughput | ~928k/s @ 100k streams | ~101k/s @ 10k streams |
+| memory @ 100k streams | ~515 MB | **OOM** |
+
+~9× on appends, and the JS server ran out of memory where Rust held ~515 MB.
+
+**The honest catch:** that reference is **Node, not Bun** — Bun's runtime is
+faster than Node, and prisma/streams was never in the ds-bench run, so Bun would
+land *above Node, below native Rust*. There is **no direct Bun-vs-this
+measurement**. But on the raw unkeyed path there's no architectural reason an
+interpreted-JS-with-GC server catches a native zero-copy one — so: almost
+certainly faster on the base path, though the exact multiple vs Bun is
+unmeasured until both are run through ds-bench on the same box.
+
 ## Layout
 
 ```
