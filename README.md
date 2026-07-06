@@ -10,24 +10,65 @@ on read. That's the [Prisma Bun server's](https://github.com/prisma/streams)
 model — now on the [`durable-streams`](https://crates.io/crates/durable-streams)
 Rust server, which had **no keyed reads at all** before this.
 
----
-
 ## Why
 
-|  | Rust `durable-streams` | Prisma `streams` (Bun) |
+| Capability | This (Rust) | Prisma (Bun) |
 |---|:---:|:---:|
-| Raw throughput / memory | 🟢 native, zero-copy | 🟡 interpreted, GC |
-| Fork / branching | 🟢 native copy-on-write | 🔴 none |
-| **Keyed reads** | 🔴 → 🟢 *(this project)* | 🟢 tiered index |
-| Durable keyed index | 🔴 → 🟢 *(this project)* | 🟢 |
-| Live keyed reads | 🔴 → 🟢 *(this project)* | 🟢 |
+| Native, zero-copy I/O | ✓ | ✗ |
+| Fork / branching | ✓ | ✗ |
+| Keyed-by-conversation reads | ✓ *(new)* | ✓ |
+| Durable keyed index | ✓ *(new)* | ✓ |
+| Live keyed reads | ✓ *(new)* | ✓ |
 
 The Rust server was the fastest known Durable Streams implementation but couldn't
-filter by key; Bun could filter but isn't native and can't fork. This closes the
-one gap that mattered — **keyed-by-conversation reads** — so the Rust server can
-be the substrate and *keep* its speed + fork advantage. Delivered as source
-patches over pristine `durable-streams-0.1.2` (the crate is a binary with no
-public upstream repo to depend on — see `docs/integration-points.md`).
+filter by key; Bun could filter but isn't native and can't fork. The bottom three
+rows are what this project adds — so the Rust server can be the substrate and
+*keep* its speed + fork advantage. Delivered as source patches over pristine
+`durable-streams-0.1.2` (the crate is a binary with no public upstream repo to
+depend on — see `docs/integration-points.md`).
+
+## Benchmarks
+
+> [!NOTE]
+> Same-machine, relative numbers (a MacBook; `oha` and the server share cores
+> over loopback, no cgroup pinning) — the crate's own `.bench-local.sh`
+> methodology, for baseline-vs-change on one box. Reproduce: `bench/bench-keyed.sh`.
+
+**Keyed read isolates one conversation** — one stream, 2000 appends round-robin
+across K=50 keys, ~200 B each; medians of 3×5 s:
+
+| scenario | rps | p50 | p99 | data returned |
+|---|--:|--:|--:|--:|
+| `?key=conv-7` (one conversation) | 16,237 | 3.2 ms | 14.6 ms | **8 KB** |
+| full stream (client-side filter) | 24,356 | 2.6 ms | 3.4 ms | 400 KB |
+
+Returns **50× less data** (8 KB vs 400 KB — exactly 1/K, proving correct
+server-side filtering) at ~⅔ the throughput of reading everything. Filtering a
+byte-log costs more CPU (it reads the coalesced superset and copies out the
+wanted spans) — the win is wire-data reduction, decisive when the network, not
+the CPU, is the bottleneck.
+
+<details>
+<summary><b>Why it got 10× faster, and base-server numbers</b></summary>
+
+<br>
+
+The keyed read went **1,644 → 16,237 rps** once it (a) read resident-cache-first
+instead of per-span file reads and (b) coalesced a key's scattered spans into few
+contiguous reads — porting Prisma's *serving pattern* ("one contiguous read,
+filter in RAM"), **not** its probabilistic index.
+
+Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
+(p50 0.39 ms), read1m 10,715 rps (p50 2.95 ms, `sendfile`), append 7,808 rps
+(p50 8.1 ms, fsync-bound). Upstream kernel-speed ceiling on dedicated hardware:
+~860k appends/s, ~2 GB/s reads, ~515 MB @ 100k streams.
+
+</details>
+
+### vs Bun, on the same machine
+
+_(Head-to-head measurement in progress — Prisma's Bun server benchmarked with the
+same harness; the table lands here.)_
 
 ## What works
 
@@ -77,76 +118,6 @@ flowchart TD
 
 On restart, the `.keys` journal is replayed (torn-tail-safe, like the WAL) to
 rebuild the in-memory directory — so keyed reads survive a crash unchanged.
-
-## Benchmarks
-
-> [!NOTE]
-> These are **same-machine, relative** numbers (a MacBook; `oha` and the server
-> share cores over loopback, no cgroup pinning) — the crate's own
-> `.bench-local.sh` methodology, for baseline-vs-change on one box. They are
-> **not** a head-to-head against Bun (that needs both on identical dedicated
-> hardware via the [ds-bench](https://github.com/electric-sql/ds-bench) K8s
-> harness, which has not been run). Reproduce: `bench/bench-keyed.sh`.
-
-**Keyed read isolates one conversation** — one stream, 2000 appends round-robin
-across K=50 keys, ~200 B each; medians of 3×5 s:
-
-| scenario | rps | p50 | p99 | data returned |
-|---|--:|--:|--:|--:|
-| `?key=conv-7` (one conversation) | 16,237 | 3.2 ms | 14.6 ms | **8 KB** |
-| full stream (client-side filter) | 24,356 | 2.6 ms | 3.4 ms | 400 KB |
-
-Returns **50× less data** (8 KB vs 400 KB — exactly 1/K, proving correct
-server-side filtering) at ~⅔ the throughput of reading everything. Filtering a
-byte-log costs more CPU (it reads the coalesced superset and copies out the
-wanted spans) — the win is wire-data reduction, decisive when the network, not
-the CPU, is the bottleneck.
-
-<details>
-<summary><b>Why it got 10× faster, and base-server numbers</b></summary>
-
-<br>
-
-The keyed read went **1,644 → 16,237 rps** once it (a) read resident-cache-first
-instead of per-span file reads and (b) coalesced a key's scattered spans into few
-contiguous reads — porting Prisma's *serving pattern* ("one contiguous read,
-filter in RAM"), **not** its probabilistic index.
-
-Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
-(p50 0.39 ms), read1m 10,715 rps (p50 2.95 ms, `sendfile`), append 7,808 rps
-(p50 8.1 ms, fsync-bound). Upstream kernel-speed ceiling on dedicated hardware:
-~860k appends/s, ~2 GB/s reads, ~515 MB @ 100k streams.
-
-</details>
-
-### Base path (no keying): native Rust vs interpreted JS
-
-Stripped of keying — plain append + plain read on the same data — the "we're
-faster" case is far stronger than for keyed reads, because:
-
-1. **The keying patches don't touch the unkeyed path.** An unkeyed append does
-   zero extra work; an unkeyed read is byte-for-byte the original code — so base
-   performance *is* the upstream kernel-speed server's (zero-copy `sendfile`).
-2. **Native Rust vs interpreted JS.** Bun's server is JIT'd + GC'd — a different
-   tier for raw throughput and memory than a native zero-copy server.
-
-Closest apples-to-apples proxy — the ds-bench run (same hardware) vs the
-**Node.js** reference server:
-
-| same hardware (ds-bench) | Rust base server | Node.js reference (JS) |
-|---|--:|--:|
-| append throughput | ~928k/s @ 100k streams | ~101k/s @ 10k streams |
-| memory @ 100k streams | ~515 MB | **OOM** |
-
-~9× on appends, and the JS server ran out of memory where Rust held ~515 MB.
-
-> [!WARNING]
-> That reference is **Node, not Bun.** Bun is faster than Node, and
-> prisma/streams was never in ds-bench — so Bun lands *above Node, below native
-> Rust*. There is **no direct Bun-vs-this measurement.** On the raw unkeyed path
-> there's no architectural reason interpreted-JS-with-GC catches native
-> zero-copy — so almost certainly faster on the base path, but the exact
-> multiple vs Bun is unmeasured until both run through ds-bench on one box.
 
 ## Honest caveats
 
