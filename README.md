@@ -50,6 +50,44 @@ in-memory directory makes it unnecessary until a stream outgrows memory or
 spans thousands of cold segments. See `docs/plan.md` and `bench/README.md`
 for that reasoning.
 
+## Benchmarks
+
+> **Scope:** these are *same-machine, relative* numbers (a MacBook, `oha` and
+> the server sharing cores, loopback, no cgroup pinning) — the vendored crate's
+> own `.bench-local.sh` methodology. They measure baseline-vs-change on one box,
+> **not** a head-to-head against Prisma's Bun server (that requires both on
+> identical dedicated hardware via the ds-bench K8s harness, which has not been
+> run). Reproduce with `bench/bench-keyed.sh` / the crate's `.bench-local.sh`.
+
+**Keyed read isolates one conversation** (`bench/bench-keyed.sh`, one stream,
+2000 appends round-robin across K=50 keys, ~200 B each; medians of 3×5 s):
+
+| scenario | rps | p50 | p99 | data returned |
+|---|---|---|---|---|
+| `?key=conv-7` (one conversation) | 16,237 | 3.2 ms | 14.6 ms | **8 KB** |
+| full stream (client-side filter) | 24,356 | 2.6 ms | 3.4 ms | 400 KB |
+
+The keyed read returns **50× less data** (8 KB vs 400 KB — exactly 1/K, proving
+correct server-side filtering) at ~⅔ the throughput of reading everything. It
+costs more CPU (filtering a byte-log reads the coalesced superset and copies out
+the wanted spans) — the win is wire-data reduction, decisive when the network,
+not the CPU, is the bottleneck.
+
+**Why it's fast** — the keyed read went 1,644 → 16,237 rps (~10×) once it (a)
+read resident-cache-first instead of per-span file reads and (b) coalesced a
+key's scattered spans into few contiguous reads. Porting Prisma's *serving
+pattern* ("one contiguous read, filter in RAM"), not its probabilistic index.
+
+**Base server (unpatched, hot stream, `.bench-local.sh`):** read1k 161,768 rps
+(p50 0.39 ms), read1m 10,715 rps (p50 2.95 ms, `sendfile`), append 7,808 rps
+(p50 8.1 ms, fsync-bound). The kernel-speed ceiling (~860k appends/s, ~2 GB/s
+reads, ~515 MB @ 100k streams) is documented upstream on dedicated hardware.
+
+**Not measured:** a true Bun-vs-this comparison on identical hardware. On
+hot/small streams this is plausibly comparable-or-better; on a huge stream with
+one key sparse across thousands of *cold* segments, Prisma's segment index
+likely wins until `crates/ds-index` is wired in (see `bench/README.md`).
+
 ## Layout
 
 ```
