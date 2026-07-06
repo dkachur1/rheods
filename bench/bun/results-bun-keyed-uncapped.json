@@ -1,0 +1,32 @@
+{
+  "label": "keyed-uncapped",
+  "n": 2000,
+  "k": 50,
+  "appendsize": 200,
+  "body_sizes": {
+    "keyed_bytes": 8000,
+    "full_bytes": 400000,
+    "keyed_status": "200",
+    "full_status": "200",
+    "full_over_keyed_ratio": "50.0",
+    "test_key": "conv-7"
+  },
+  "scenarios": [
+    {
+      "name": "keyed_read",
+      "rps_median": 6485.220901839524,
+      "p50ms_median": 9.456334,
+      "p99ms_median": 15.077084,
+      "cpu_pct_median": 102.16666666666666,
+      "success_min": 1.0
+    },
+    {
+      "name": "full_read",
+      "rps_median": 1135.5111139581118,
+      "p50ms_median": 54.5385,
+      "p99ms_median": 84.272792,
+      "cpu_pct_median": 123.83333333333333,
+      "success_min": 1.0
+    }
+  ]
+}

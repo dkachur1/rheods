@@ -1,0 +1,21 @@
+{
+  "label": "base",
+  "scenarios": [
+    {
+      "name": "read1k",
+      "rps_median": 29698.220756196926,
+      "p50ms_median": 1.957333,
+      "p99ms_median": 4.059042,
+      "cpu_pct_median": 103.83333333333333,
+      "success_min": 1.0
+    },
+    {
+      "name": "append100",
+      "rps_median": 203.19981412213724,
+      "p50ms_median": 332.036667,
+      "p99ms_median": 336.09337500000004,
+      "cpu_pct_median": 9.500000000000002,
+      "success_min": 1.0
+    }
+  ]
+}

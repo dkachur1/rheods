@@ -5,3 +5,5 @@ Cargo.lock
 .DS_Store
 client-verify/node_modules
 client-verify/durable-streams-server
+bench/bun/prisma-streams/
+bench/bun/*-data/

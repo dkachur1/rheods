@@ -67,8 +67,34 @@ Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
 
 ### vs Bun, on the same machine
 
-_(Head-to-head measurement in progress — Prisma's Bun server benchmarked with the
-same harness; the table lands here.)_
+Prisma's Bun server (`prisma/streams` @ `b891877`, v0.1.11; Bun 1.3.9) run on
+**this box with the same harness** (N=2000, K=50, ~200 B, c=64, 6 s × 3). Both do
+keyed reads with **zero schema setup** (default profile) — no config divergence.
+
+| scenario | This (Rust) | Bun | 
+|---|--:|--:|
+| **keyed read** `?key=` | **16,237 rps** · 3.2 ms p50 | 6,485 rps · 9.5 ms p50 |
+| &nbsp;&nbsp;↳ CPU per request | ~1,180% total | **~100% total** |
+| **full read** (uncapped) | **24,356 rps** · 2.6 ms | 1,135 rps · 54.5 ms |
+| append (unkeyed) | ~7,808 rps | ~203 rps* |
+
+**The honest read:**
+- **Keyed read** — Rust is ~2.5× the throughput and ~3× lower latency, **but at
+  ~4.5× the CPU per request.** Our speed comes from reading the coalesced
+  *superset* across many cores; Bun's fingerprint index touches only the
+  relevant blocks (~1 core). So *per core*, Bun's keyed read is leaner — the
+  concrete case for wiring `crates/ds-index` when CPU-bound or at cold-segment
+  scale. Rust wins wall-clock here; Bun wins CPU-efficiency.
+- **Full read** — Rust ~21× (native zero-copy `sendfile` vs interpreted copy).
+  This is the base-path gap, and it's large.
+- **Append*** — Bun measured ~203 rps / ~330 ms p50, low enough that it looks
+  like queueing under c=64 / local-mode ingest tuning rather than a clean
+  throughput number; flagged, **not** root-caused — don't read it as a
+  definitive multiple.
+- Bun defaults to a 1000-record read cap (a stock `GET` returned half the
+  stream); the full-read number above is with that cap raised, for parity.
+
+Raw numbers + scripts in `bench/bun/`.
 
 ## What works
 
