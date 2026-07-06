@@ -1,4 +1,4 @@
-# durable-streams-keyed
+# rheoDS
 
 > **Keyed-by-conversation reads for the Rust Durable Streams server.**
 > Read one conversation out of a multiplexed stream — fast, durable, live.
