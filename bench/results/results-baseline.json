@@ -1,0 +1,42 @@
+{
+  "label": "baseline",
+  "scenarios": [
+    {
+      "name": "read1k",
+      "rps_median": 161768.4837140509,
+      "p50ms_median": 0.389458,
+      "p99ms_median": 0.535584,
+      "cpu_pct_median": 328.16666666666663,
+      "success_min": 1.0
+    },
+    {
+      "name": "read1m",
+      "rps_median": 10715.44467329588,
+      "p50ms_median": 2.94625,
+      "p99ms_median": 4.125166,
+      "cpu_pct_median": 394.16666666666663,
+      "success_min": 1.0
+    },
+    {
+      "name": "append100",
+      "rps_median": 7808.370456090826,
+      "p50ms_median": 8.098417,
+      "p99ms_median": 14.014166999999999,
+      "cpu_pct_median": 27.666666666666668,
+      "success_min": 1.0
+    },
+    {
+      "name": "append_tier",
+      "rps_median": 8063.638165784759,
+      "p50ms_median": 7.099417,
+      "p99ms_median": 17.860667,
+      "cpu_pct_median": 31.66666666666666,
+      "success_min": 1.0
+    }
+  ],
+  "append_tier_disk": {
+    "live_file_bytes": 14495200,
+    "data_dir_kb": 34020,
+    "cold_dir_kb": 13312
+  }
+}

@@ -1,0 +1,10 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,7 @@
+ mod engine_raw;
+ mod handlers;
+ mod http1;
++mod key_journal;
+ mod store;
+ mod telemetry;
+ mod tier;

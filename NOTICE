@@ -1,0 +1,16 @@
+ds-indexed-rust
+Copyright 2026 Danylo Kachur
+
+This project vendors and patches source from `durable-streams` 0.1.2
+(https://crates.io/crates/durable-streams), licensed under the Apache
+License, Version 2.0. That source is fetched by `scripts/vendor-upstream.sh`
+into `vendor/` (not committed — see .gitignore) and modified in place via the
+patches in `patches/`, per Apache-2.0 section 4(b): this NOTICE records that
+modified files carry prominent notice of the changes, and the patches
+directory documents the modifications themselves.
+
+`crates/ds-index/` is original code, independently implemented from the
+publicly documented design of Prisma's tiered routing-key index
+(docs/tiered-index.md, https://github.com/prisma/streams, Apache-2.0) — no
+code from that project is copied or vendored here, only the documented
+design (fingerprint scheme, run-span sizing, filter-then-scan lookup shape).

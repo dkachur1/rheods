@@ -1,0 +1,22 @@
+[package]
+name = "ds-index"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Routing-key index for durable-streams: fingerprint runs + binary fuse filters over sealed segments"
+
+[dependencies]
+# SipHash-2-4 keyed fingerprinting — same primitive Prisma's tiered-index docs
+# describe (docs/tiered-index.md: "64-bit fingerprints (SipHash-2-4)").
+siphasher = "1"
+# Binary fuse filters (Graf & Lemire) for fast negative lookups before
+# touching the postings/mask data — avoids hand-rolling filter math.
+xorf = "0.11"
+byteorder = "1"
+thiserror = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

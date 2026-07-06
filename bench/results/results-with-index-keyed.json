@@ -1,0 +1,32 @@
+{
+  "label": "with-index",
+  "n": 2000,
+  "k": 50,
+  "appendsize": 200,
+  "body_sizes": {
+    "keyed_bytes": 8000,
+    "full_bytes": 400000,
+    "keyed_status": "200",
+    "full_status": "200",
+    "full_over_keyed_ratio": "50.0",
+    "test_key": "conv-7"
+  },
+  "scenarios": [
+    {
+      "name": "keyed_read",
+      "rps_median": 1643.9888868677533,
+      "p50ms_median": 37.750417,
+      "p99ms_median": 75.746583,
+      "cpu_pct_median": 1205.6,
+      "success_min": 1.0
+    },
+    {
+      "name": "full_read_client_filter",
+      "rps_median": 24483.164628433708,
+      "p50ms_median": 2.5843749999999996,
+      "p99ms_median": 3.560917,
+      "cpu_pct_median": 375.99999999999966,
+      "success_min": 1.0
+    }
+  ]
+}

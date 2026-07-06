@@ -1,0 +1,428 @@
+--- a/src/wal/e2e_tests.rs
++++ b/src/wal/e2e_tests.rs
+@@ -118,6 +118,37 @@
+     }
+ }
+ 
++/// Build a `POST` (append) request for `path` with extra headers (e.g. `Stream-Key`).
++fn post_req_with(path: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) -> Req {
++    let mut headers = vec![("content-type".to_string(), content_type.to_string())];
++    for (k, v) in extra {
++        headers.push((k.to_string(), v.to_string()));
++    }
++    Req {
++        method: Method::Post,
++        path: path.to_string(),
++        query: None,
++        headers,
++        body: Bytes::copy_from_slice(body),
++    }
++}
++
++/// Build a `GET` (read) request for `path` with an optional raw query string.
++fn get_req(path: &str, query: Option<&str>) -> Req {
++    Req {
++        method: Method::Get,
++        path: path.to_string(),
++        query: query.map(|s| s.to_string()),
++        headers: vec![],
++        body: Bytes::new(),
++    }
++}
++
++/// Look up a response header by (lowercase) name.
++fn resp_header<'a>(resp: &'a crate::api::Resp, name: &str) -> Option<&'a str> {
++    resp.headers.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
++}
++
+ /// Create a stream over the REAL HTTP path; assert a 2xx.
+ async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
+     let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
+@@ -864,3 +895,387 @@
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++// ===========================================================================
++// (9) KEYED CATCH-UP READS (`Stream-Key` append directory + `?key=` reads)
++// ===========================================================================
++
++/// Three durable WAL-mode appends interleaved across two routing keys must be
++/// gathered, in append order, per key — over the REAL handler path
++/// (`handle` → `handle_append_inner` records `st.key_dir`; `handle` →
++/// `handle_catchup` → `handle_keyed_catchup` reads it back), not a store-level
++/// unit test. This is the genuine end-to-end surface: an HTTP POST with a
++/// `Stream-Key` header, then an HTTP GET with `?key=`.
++#[tokio::test]
++async fn e2e_keyed_catchup_gathers_interleaved_appends_in_order() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-catchup");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/s", OCTET).await;
++
++    // Interleaved: a, b, a — key "a"'s two appends must concatenate in the
++    // order they were durably written, not the order they'd sort/group in.
++    for (key, body) in [("a", &b"AAAA"[..]), ("b", &b"BBBB"[..]), ("a", &b"AA"[..])] {
++        let resp = handlers::handle(
++            Arc::clone(&h.store),
++            post_req_with("k/s", OCTET, body, &[("stream-key", key)]),
++        )
++        .await;
++        assert!(
++            (200..300).contains(&resp.status),
++            "keyed append key={key} expected 2xx ack, got {}",
++            resp.status
++        );
++    }
++
++    let resp_a = handlers::handle(Arc::clone(&h.store), get_req("k/s", Some("key=a"))).await;
++    assert_eq!(resp_a.status, 200, "keyed catch-up for key=a must 200");
++    match resp_a.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAAAA")),
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    let resp_b = handlers::handle(Arc::clone(&h.store), get_req("k/s", Some("key=b"))).await;
++    assert_eq!(resp_b.status, 200, "keyed catch-up for key=b must 200");
++    match resp_b.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"BBBB")),
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// A `Stream-Key` composes with every read mode, including live long-poll — a
++/// keyed long-poll over already-durable backlog (the `from < tail` fast path in
++/// `handle_long_poll`) must 200 with just that key's bytes, using the same
++/// filtered-projection headers as `handle_keyed_catchup` (no ETag, no-store).
++#[tokio::test]
++async fn e2e_keyed_long_poll_serves_backlog_filtered_by_key() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-live-backlog");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/s", OCTET).await;
++
++    for (key, body) in [("a", &b"AAAA"[..]), ("b", &b"BBBB"[..])] {
++        let resp = handlers::handle(
++            Arc::clone(&h.store),
++            post_req_with("k/s", OCTET, body, &[("stream-key", key)]),
++        )
++        .await;
++        assert!(
++            (200..300).contains(&resp.status),
++            "keyed append key={key} expected 2xx ack, got {}",
++            resp.status
++        );
++    }
++
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        get_req("k/s", Some("offset=-1&live=long-poll&key=a")),
++    )
++    .await;
++    assert_eq!(resp.status, 200, "keyed long-poll backlog must 200, got {}", resp.status);
++    assert!(resp_header(&resp, "etag").is_none(), "keyed live read must not carry an ETag");
++    assert_eq!(resp_header(&resp, "cache-control"), Some("no-store"));
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAA")),
++        _ => panic!("expected a Body::Full for a keyed long-poll read"),
++    }
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// Restart durability for the keyed-read directory (`key_dir` / the
++/// `.keys` journal, see `key_journal.rs`): `key_dir` is in-memory state, so
++/// without a durable journal it would come back EMPTY after a crash even
++/// though the underlying data survives fine (it's in the WAL). This drives
++/// the same interleaved keyed appends as
++/// `e2e_keyed_catchup_gathers_interleaved_appends_in_order` above, then closes
++/// the stream (forcing the durable `write_meta_sync` that piggybacks the
++/// journal's fsync — see `store::write_meta_sync` — so the test doesn't race
++/// the ~100ms debounce), simulates a crash exactly like the no-loss tests
++/// (abort committers, drop the store + WalSet, keep the data dir), and
++/// reopens with the full startup recovery sequence. A `?key=` read after
++/// restart must return byte-identical to before it.
++#[tokio::test]
++async fn e2e_keyed_index_survives_restart() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-restart");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/restart", OCTET).await;
++
++    for (key, body) in [("a", &b"AAAA"[..]), ("b", &b"BBBB"[..]), ("a", &b"AA"[..])] {
++        let resp = handlers::handle(
++            Arc::clone(&h.store),
++            post_req_with("k/restart", OCTET, body, &[("stream-key", key)]),
++        )
++        .await;
++        assert!(
++            (200..300).contains(&resp.status),
++            "keyed append key={key} expected 2xx ack, got {}",
++            resp.status
++        );
++    }
++
++    // Force the durable meta write that piggybacks the journal fsync (see
++    // `write_meta_sync`), so the assertions below hold deterministically
++    // rather than racing the debounced ~100ms flush.
++    let close_resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("k/restart", OCTET, b"", &[("stream-closed", "true")]),
++    )
++    .await;
++    assert!(
++        (200..300).contains(&close_resp.status),
++        "close expected 2xx, got {}",
++        close_resp.status
++    );
++
++    // Sanity before the crash (mirrors the non-restart keyed test above).
++    let resp_a = handlers::handle(Arc::clone(&h.store), get_req("k/restart", Some("key=a"))).await;
++    assert_eq!(resp_a.status, 200);
++    match resp_a.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAAAA")),
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++    let resp_b = handlers::handle(Arc::clone(&h.store), get_req("k/restart", Some("key=b"))).await;
++    assert_eq!(resp_b.status, 200);
++    match resp_b.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"BBBB")),
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    // CRASH + full recovery, exactly like the no-loss tests above.
++    h.crash();
++    let h2 = Harness::boot(&dir, None, 1).unwrap();
++
++    // The keyed index must be REBUILT from the `.keys` journal, not reset
++    // empty, so these reads still return exactly what they did pre-crash.
++    let resp_a2 = handlers::handle(Arc::clone(&h2.store), get_req("k/restart", Some("key=a"))).await;
++    assert_eq!(resp_a2.status, 200, "key=a catch-up must still 200 after restart");
++    match resp_a2.body {
++        crate::api::Body::Full(b) => {
++            assert_eq!(b, Bytes::from_static(b"AAAAAA"), "key=a spans survive restart")
++        }
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++    let resp_b2 = handlers::handle(Arc::clone(&h2.store), get_req("k/restart", Some("key=b"))).await;
++    assert_eq!(resp_b2.status, 200, "key=b catch-up must still 200 after restart");
++    match resp_b2.body {
++        crate::api::Body::Full(b) => {
++            assert_eq!(b, Bytes::from_static(b"BBBB"), "key=b spans survive restart")
++        }
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    h2.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// Durable-at-ack: a keyed append's index entry survives a crash even with NO
++/// prior close, NO meta flush, and NO debounce wait — proving the per-append
++/// journal fsync in `record_keyed_append` (not the close path) is what closes
++/// the crash-tail window. This is the difference between "as robust as Bun" and
++/// "robust within ~100ms": the append is acked, we crash immediately, and the
++/// key routing is still there on restart.
++#[tokio::test]
++async fn e2e_keyed_index_durable_at_ack_without_close() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-durable-at-ack");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/ack", OCTET).await;
++
++    for (key, body) in [("a", &b"AAAA"[..]), ("b", &b"BBBB"[..]), ("a", &b"AA"[..])] {
++        let resp = handlers::handle(
++            Arc::clone(&h.store),
++            post_req_with("k/ack", OCTET, body, &[("stream-key", key)]),
++        )
++        .await;
++        assert!(
++            (200..300).contains(&resp.status),
++            "keyed append key={key} expected 2xx ack, got {}",
++            resp.status
++        );
++    }
++
++    // No close, no meta flush — crash straight after the acks. Only the
++    // per-append fsync can have made the key routing durable.
++    h.crash();
++    let h2 = Harness::boot(&dir, None, 1).unwrap();
++
++    let resp_a = handlers::handle(Arc::clone(&h2.store), get_req("k/ack", Some("key=a"))).await;
++    assert_eq!(resp_a.status, 200, "key=a must survive a crash with no prior close");
++    match resp_a.body {
++        crate::api::Body::Full(b) => {
++            assert_eq!(b, Bytes::from_static(b"AAAAAA"), "key=a durable at ack")
++        }
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++    let resp_b = handlers::handle(Arc::clone(&h2.store), get_req("k/ack", Some("key=b"))).await;
++    assert_eq!(resp_b.status, 200, "key=b must survive a crash with no prior close");
++    match resp_b.body {
++        crate::api::Body::Full(b) => {
++            assert_eq!(b, Bytes::from_static(b"BBBB"), "key=b durable at ack")
++        }
++        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    h2.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++// ===========================================================================
++// (10) LIVE KEYED READS (`?key=` composed with `live=long-poll` / `live=sse`)
++// ===========================================================================
++
++/// A keyed long-poll wakes on ANY new append (not just its key's — same wait
++/// primitive as the unkeyed path), then filters to its key's bytes in the
++/// newly-arrived range and ALWAYS reports the underlying tail as
++/// `Stream-Next-Offset`. A wake whose new bytes were all another key's must
++/// still 200 (empty body, up-to-date) and advance past it — never re-scanned
++/// on the next long-poll — while a wake that does match the key returns
++/// exactly that key's bytes. Drives two sequential long-polls over the REAL
++/// HTTP path (`handle` → `handle_long_poll` → `long_poll_data`), interleaved
++/// with appends under two different `Stream-Key`s.
++#[tokio::test]
++async fn e2e_keyed_long_poll_advances_past_other_keys_data() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-long-poll");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/lp", OCTET).await;
++
++    // First long-poll: parked at offset 0 (the stream is empty, no backlog).
++    let store1 = Arc::clone(&h.store);
++    let poll1 = tokio::spawn(async move {
++        handlers::handle(
++            store1,
++            get_req("k/lp", Some(&format!("offset={}&live=long-poll&key=a", fork_offset(0)))),
++        )
++        .await
++    });
++    tokio::task::yield_now().await;
++
++    // Append under key "b" only — must wake the parked key=a long-poll with an
++    // up-to-date, EMPTY response that still advances past it.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("k/lp", OCTET, b"BBBB", &[("stream-key", "b")]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "append b expected 2xx, got {}", resp.status);
++
++    let resp1 = poll1.await.unwrap();
++    assert_eq!(resp1.status, 200, "keyed long-poll wake must 200, got {}", resp1.status);
++    let next1 = fork_offset(4);
++    assert_eq!(
++        resp_header(&resp1, "stream-next-offset"),
++        Some(next1.as_str()),
++        "next-offset must advance to the underlying tail even with no key match"
++    );
++    assert_eq!(resp_header(&resp1, "stream-up-to-date"), Some("true"));
++    assert_eq!(resp_header(&resp1, "cache-control"), Some("no-store"));
++    assert!(resp_header(&resp1, "etag").is_none(), "keyed live read must not carry an ETag");
++    match resp1.body {
++        crate::api::Body::Full(b) => assert!(b.is_empty(), "key=a must not see key b's bytes"),
++        _ => panic!("expected a Body::Full for a keyed long-poll read"),
++    }
++
++    // Second long-poll: from the advanced offset (4), parked again.
++    let store2 = Arc::clone(&h.store);
++    let poll2 = tokio::spawn(async move {
++        handlers::handle(
++            store2,
++            get_req("k/lp", Some(&format!("offset={}&live=long-poll&key=a", fork_offset(4)))),
++        )
++        .await
++    });
++    tokio::task::yield_now().await;
++
++    // Append under key "a" — must wake with exactly this key's bytes.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("k/lp", OCTET, b"AAAA", &[("stream-key", "a")]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "append a expected 2xx, got {}", resp.status);
++
++    let resp2 = poll2.await.unwrap();
++    assert_eq!(resp2.status, 200, "keyed long-poll wake must 200, got {}", resp2.status);
++    let next2 = fork_offset(8);
++    assert_eq!(resp_header(&resp2, "stream-next-offset"), Some(next2.as_str()));
++    match resp2.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAA")),
++        _ => panic!("expected a Body::Full for a keyed long-poll read"),
++    }
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// A keyed SSE subscriber emits only its key's bytes as `data` events; a wake
++/// whose new bytes were all another key's still advances `pos` (so the next
++/// control event's `streamNextOffset` moves past it) but sends NO `data` event
++/// — control only. Drives the REAL SSE handler (`handle` → `handle_sse`),
++/// draining the `Body::Channel` frame-by-frame between appends so each
++/// append's wake is observed individually rather than coalesced with the next.
++#[tokio::test]
++async fn e2e_keyed_sse_emits_only_key_frames() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("keyed-sse");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "k/sse", "text/plain").await;
++
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        get_req("k/sse", Some("offset=-1&live=sse&key=a")),
++    )
++    .await;
++    assert_eq!(resp.status, 200, "sse handshake expected 200, got {}", resp.status);
++    let mut rx = match resp.body {
++        crate::api::Body::Channel(sb) => sb.rx,
++        _ => panic!("expected a Body::Channel for an SSE response"),
++    };
++
++    // Initial caught-up control event (no data yet — the stream is empty).
++    let initial = rx.recv().await.expect("initial control event");
++    let initial = String::from_utf8(initial.to_vec()).unwrap();
++    assert!(initial.contains("event: control"), "expected initial control event, got {initial:?}");
++    assert!(!initial.contains("event: data"), "no data expected before any append, got {initial:?}");
++
++    // Append under key "b" — the wake must be control-only (no data event),
++    // but still advances past it.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("k/sse", "text/plain", b"BBBB", &[("stream-key", "b")]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "append b expected 2xx, got {}", resp.status);
++    let after_b = rx.recv().await.expect("control event after key b append");
++    let after_b = String::from_utf8(after_b.to_vec()).unwrap();
++    assert!(!after_b.contains("event: data"), "key=a must not see key b's bytes, got {after_b:?}");
++    assert!(after_b.contains("event: control"), "must still advance via a control event, got {after_b:?}");
++
++    // Append under key "a" — must emit exactly this key's bytes as a data event.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("k/sse", "text/plain", b"AAAA", &[("stream-key", "a")]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "append a expected 2xx, got {}", resp.status);
++    let after_a = rx.recv().await.expect("data event after key a append");
++    let after_a = String::from_utf8(after_a.to_vec()).unwrap();
++    assert!(after_a.contains("event: data"), "expected a data event for key=a, got {after_a:?}");
++    assert!(after_a.contains("data:AAAA"), "expected key a's payload, got {after_a:?}");
++    assert!(!after_a.contains("BBBB"), "keyed SSE must not leak key b's bytes, got {after_a:?}");
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}

@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/ds-index"]
+# The vendored upstream server is built standalone (it's a fetched binary
+# crate we patch in place), not as a workspace member — see
+# scripts/vendor-upstream.sh and docs/integration-points.md.
+exclude = ["vendor"]

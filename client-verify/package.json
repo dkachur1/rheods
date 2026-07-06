@@ -1,0 +1,15 @@
+{
+  "name": "ds-client-verify",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Verifies the real @durable-streams/client + @durable-streams/state JS clients against the patched ds-indexed-rust server's keyed reads (?key=).",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@durable-streams/client": "0.2.6",
+    "@durable-streams/state": "0.3.1",
+    "@tanstack/db": "0.6.0"
+  }
+}

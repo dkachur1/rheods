@@ -1,0 +1,183 @@
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -179,6 +179,13 @@
+     /// pass (between the intent meta-write and its clear). Persisted by
+     /// `Meta::capture` so a crash mid-compaction is recoverable. See tier.rs.
+     pub compaction: StdMutex<Option<PendingCompaction>>,
++    /// Keyed-read append directory: routing key → ordered `(logical_offset, len)`
++    /// spans, one per durable append made with that `Stream-Key`. Backed by a
++    /// durable per-stream journal (`<data file>.keys`, see `key_journal.rs`) so
++    /// the index survives a restart. Use `record_keyed_append` / `keyed_spans`
++    /// rather than locking this directly — the in-memory map and the durable
++    /// journal must move together (see `KeyDir`).
++    pub key_dir: StdMutex<KeyDir>,
+ }
+ 
+ /// Crash-recovery intent for a live-file compaction in progress. While set, the
+@@ -309,8 +316,70 @@
+             format!("\"{}:{}:{}:c\"", self.id, start, end)
+         } else {
+             format!("\"{}:{}:{}\"", self.id, start, end)
++        }
++    }
++
++    /// Record one durable keyed append: push into the in-memory index and
++    /// append the framed record to the durable journal as a single atomic
++    /// step under `key_dir`'s lock. Call only after the append is durable (WAL
++    /// fsync / memory-mode page-cache ack) — same visibility ordering as
++    /// `publish_durable_tail` (see `handlers::handle_append_inner`).
++    pub fn record_keyed_append(&self, key: &str, offset: u64, len: u64) {
++        let mut kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
++        kd.map.entry(key.to_string()).or_default().push((offset, len));
++        kd.journal.append(key, offset, len);
++        // Durable-at-ack: fsync the journal entry before this keyed append is
++        // acked to the client, so a hard crash immediately after the ack cannot
++        // lose the key's index entry (its data is already WAL-durable). Called
++        // from the append path, which is already serialized per stream by the
++        // appender lock, so this adds no new write contention; a concurrent
++        // keyed READ on the same stream may briefly wait on the fsync. The
++        // deferred `write_meta_sync` flush remains as a backstop (a no-op once
++        // this has already cleared the dirty flag).
++        kd.journal.flush_if_dirty();
++    }
++
++    /// Exact `(offset, len)` spans recorded under `key` whose offset falls in
++    /// `[start, end)`, in append order (see `handlers::handle_keyed_catchup`).
++    pub fn keyed_spans(&self, key: &str, start: u64, end: u64) -> Vec<(u64, u64)> {
++        let kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
++        kd.map
++            .get(key)
++            .map(|v| {
++                v.iter()
++                    .copied()
++                    .filter(|(off, _)| *off >= start && *off < end)
++                    .collect()
++            })
++            .unwrap_or_default()
++    }
++}
++
++/// In-memory keyed-read index plus its durable journal (`key_journal.rs`), one
++/// lock (`StreamState::key_dir`) so the memory push and the durable append are
++/// a single atomic step: `handle_keyed_catchup`'s coalescing scan assumes push
++/// order == offset order, and replay after a restart must reproduce the exact
++/// order a live run saw.
++pub struct KeyDir {
++    map: HashMap<String, Vec<(u64, u64)>>,
++    journal: crate::key_journal::KeyJournal,
++}
++
++impl KeyDir {
++    /// A freshly created stream: no keyed appends yet, no journal file.
++    fn empty(file_path: &std::path::Path) -> Self {
++        KeyDir {
++            map: HashMap::new(),
++            journal: crate::key_journal::KeyJournal::empty(file_path),
+         }
+     }
++
++    /// Rebuild from the durable journal on boot — see
++    /// `key_journal::KeyJournal::recover`.
++    fn recovered(file_path: &std::path::Path) -> Self {
++        let (map, journal) = crate::key_journal::KeyJournal::recover(file_path);
++        KeyDir { map, journal }
++    }
+ }
+ 
+ pub struct Store {
+@@ -388,6 +457,7 @@
+     fn recover(&self, streams_dir: &std::path::Path) -> std::io::Result<()> {
+         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
+         let mut data_files: Vec<PathBuf> = Vec::new();
++        let mut key_journal_files: Vec<PathBuf> = Vec::new();
+         for entry in std::fs::read_dir(streams_dir)? {
+             let p = entry?.path();
+             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+@@ -399,6 +469,14 @@
+                 // durable residual for a pending intent, else removed there). Do
+                 // NOT treat it as an orphan data file — that would delete the
+                 // durable residual before recovery can promote it.
++            } else if name.ends_with(".keys") {
++                // Per-stream keyed-append journal (key_journal.rs). Recovered
++                // directly by `recover_one_inner` from its own `file_path`, not
++                // through the generic data-file bucket below — just keep it out
++                // of that bucket. Swept separately below if its data file is
++                // gone (a crash mid hard-delete, after the data file but before
++                // this sidecar was removed).
++                key_journal_files.push(p);
+             } else if name.ends_with(".meta") {
+                 let data_path = PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
+                 if data_path.exists() {
+@@ -417,6 +495,14 @@
+         // Drop orphan data files (no usable sidecar).
+         for p in data_files {
+             if !metas.values().any(|(_, dp)| *dp == p) {
++                let _ = std::fs::remove_file(&p);
++            }
++        }
++        // Drop orphan key journals (their data file is gone).
++        for p in key_journal_files {
++            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
++            let data_path = p.with_file_name(name.trim_end_matches(".keys"));
++            if !metas.values().any(|(_, dp)| *dp == data_path) {
+                 let _ = std::fs::remove_file(&p);
+             }
+         }
+@@ -577,6 +663,8 @@
+             // the file size each boot (see `file_base` above), so the in-memory
+             // cell starts clear; the next meta write persists the cleared marker.
+             compaction: StdMutex::new(None),
++            // Rebuilt from the durable `.keys` journal, if any — see KeyDir.
++            key_dir: StdMutex::new(KeyDir::recovered(data_path)),
+             config: StreamConfig {
+                 content_type: meta.content_type.clone(),
+                 ttl_seconds: meta.ttl_seconds,
+@@ -638,6 +726,7 @@
+             let fp = st.file_path.clone();
+             tokio::task::spawn_blocking(move || {
+                 let _ = std::fs::remove_file(meta_path(&fp));
++                let _ = std::fs::remove_file(crate::key_journal::key_journal_path(&fp));
+                 let _ = std::fs::remove_file(fp);
+             });
+             self.release_parent(st);
+@@ -668,6 +757,7 @@
+             let fp = parent.file_path.clone();
+             tokio::task::spawn_blocking(move || {
+                 let _ = std::fs::remove_file(meta_path(&fp));
++                let _ = std::fs::remove_file(crate::key_journal::key_journal_path(&fp));
+                 let _ = std::fs::remove_file(fp);
+             });
+             cur = parent.parent.clone();
+@@ -709,6 +799,8 @@
+             bytes: base_offset,
+             closed,
+         });
++        // Computed before the struct literal moves `file_path` into its field.
++        let key_dir = StdMutex::new(KeyDir::empty(&file_path));
+         let state = Arc::new(StreamState {
+             id,
+             path: path.to_string(),
+@@ -738,6 +830,7 @@
+             tier: crate::tier::TierState::default(),
+             blobstore: self.blobstore.clone(),
+             compaction: StdMutex::new(None),
++            key_dir,
+             config,
+         });
+         match self.streams.entry(path.to_string()) {
+@@ -1024,6 +1117,15 @@
+     if durable {
+         fsync_parent_dir(&final_path)?;
+     }
++    // Piggyback the key journal's fsync on this sidecar flush point (both the
++    // debounced ~100ms path and every durable write) instead of a dedicated
++    // per-append fsync — see key_journal.rs for the durability guarantee this
++    // gives keyed reads across a restart. A no-op when nothing is pending.
++    st.key_dir
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .journal
++        .flush_if_dirty();
+     Ok(())
+ }
+ 

@@ -1,0 +1,389 @@
+--- /dev/null
++++ b/src/key_journal.rs
+@@ -0,0 +1,386 @@
++//! Per-stream keyed-append durable journal (`<data file>.keys`).
++//!
++//! `StreamState::key_dir` is the routing-key → `(offset, len)` span index that
++//! backs `?key=` keyed catch-up reads (see `handlers::handle_keyed_catchup`).
++//! The routing key lives only in the `Stream-Key` request header — it is never
++//! part of the WAL record or the wire bytes — so unlike the stream's data
++//! (durable in the WAL/log) and its metadata (durable in the `.meta` sidecar),
++//! this index has nowhere else to be reconstructed from after a restart. This
++//! module is that missing durable copy.
++//!
++//! # On-disk layout
++//!
++//! One flat, append-only file per stream, created lazily on the stream's FIRST
++//! keyed append (a stream that never uses `Stream-Key` never gets a `.keys`
++//! file — see `KeyDir::empty`). Each durable keyed append appends one framed
++//! record:
++//!
++//! ```text
++//! u32  key_len
++//! u64  offset        // stream_offset — the pre-append logical offset
++//! u64  len           // wire byte length of the append
++//! u32  crc32c        // over [key_len, offset, len, key_bytes], all LE
++//! [key_len bytes] key
++//! ```
++//!
++//! Fixed header is 24 bytes ([`HEADER_LEN`]), followed by `key_len` key bytes.
++//! All multi-byte integers are little-endian.
++//!
++//! **Torn-tail detection** mirrors `wal::codec`: replay ([`replay`]) walks
++//! records from offset 0 and stops at the first one whose CRC fails, whose
++//! `key_len` runs past EOF, or whose header is all-zero — that is the clean
++//! end of the durable log, not corruption (same philosophy as the WAL's
++//! header-CRC-doubles-as-torn-detector design; see `wal::codec` module docs).
++//! On recovery ([`KeyJournal::recover`]) any bytes past that point are
++//! truncated before the file is reopened for further appends — otherwise a
++//! later append would land after an unreachable gap of garbage that a future
++//! replay would stop at before ever reaching it (the WAL's C1 torn-tail
++//! reasoning, applied here at whole-journal-file granularity instead of a
++//! reconciled byte tail).
++//!
++//! # Durability guarantee
++//!
++//! **Durable at ack — no crash-tail window.** `StreamState::record_keyed_append`
++//! fsyncs the journal ([`KeyJournal::flush_if_dirty`]) before the keyed append
++//! is acked to the client, so a hard crash immediately after the ack still
++//! rebuilds that append's routing on restart. A keyed append is therefore
++//! exactly as durably indexed as its data is durable in the WAL/log — there is
++//! no acked-but-unindexed gap. This costs one journal fsync per keyed append on
++//! top of the WAL group-commit fsync; the append path is already serialized per
++//! stream by the appender lock, so it adds no new write contention (a
++//! concurrent keyed *read* on the same stream may briefly wait on the fsync).
++//!
++//! [`flush_if_dirty`](KeyJournal::flush_if_dirty) is also still called from
++//! `store::write_meta_sync` as a backstop (a no-op once the per-append fsync has
++//! cleared the dirty flag). A journal write that *fails* (open/write error) is
++//! best-effort per [`append`](KeyJournal::append) — it leaves that record
++//! memory-only for the run and never fails the append itself; the underlying
++//! data is never at risk (it is durable in the WAL/log independent of this
++//! journal). Perf note: batching these fsyncs into the WAL group commit would
++//! amortize the per-append cost — a future optimization, not a correctness need.
++
++use std::collections::HashMap;
++use std::fs::{File, OpenOptions};
++use std::path::{Path, PathBuf};
++
++use crate::store::barrier_fsync;
++
++/// Fixed-size record header: `key_len(4) + offset(8) + len(8) + crc32c(4)`.
++pub const HEADER_LEN: usize = 4 + 8 + 8 + 4;
++
++/// Sanity cap on a decoded `key_len`. Routing keys are short strings in
++/// practice; a `key_len` this large is essentially certain to be a torn/
++/// garbled header rather than a legitimate key, so treat it as torn rather
++/// than attempting a multi-KB slice on the strength of an unverified length.
++const MAX_KEY_LEN: usize = 4096;
++
++/// Result of decoding one record at a byte offset. See the module docs for
++/// `Torn` vs `Incomplete`; both end replay the same way (the durable log ends
++/// before this point) — they are kept distinct only for diagnosability.
++enum Decoded {
++    Record {
++        key: String,
++        offset: u64,
++        len: u64,
++        total: usize,
++    },
++    /// Not enough bytes for a header, or an all-zero header.
++    Incomplete,
++    /// A header is present but its CRC is bad, its key bytes are not fully
++    /// present, or the key isn't valid UTF-8 (should be unreachable once the
++    /// CRC passes, kept as a defensive last check).
++    Torn,
++}
++
++/// crc32c over the fixed fields (`key_len`, `offset`, `len`, little-endian)
++/// followed by the key bytes. Shared by [`encode`] and [`decode_at`] so they
++/// cannot diverge.
++fn record_crc(key_len: u32, offset: u64, len: u64, key: &[u8]) -> u32 {
++    let mut f = Vec::with_capacity(HEADER_LEN - 4 + key.len());
++    f.extend_from_slice(&key_len.to_le_bytes());
++    f.extend_from_slice(&offset.to_le_bytes());
++    f.extend_from_slice(&len.to_le_bytes());
++    f.extend_from_slice(key);
++    crc32c::crc32c(&f)
++}
++
++/// Encode one framed record ready to append to the journal file.
++fn encode(key: &str, offset: u64, len: u64) -> Vec<u8> {
++    let kb = key.as_bytes();
++    let key_len = kb.len() as u32;
++    let crc = record_crc(key_len, offset, len, kb);
++    let mut out = Vec::with_capacity(HEADER_LEN + kb.len());
++    out.extend_from_slice(&key_len.to_le_bytes());
++    out.extend_from_slice(&offset.to_le_bytes());
++    out.extend_from_slice(&len.to_le_bytes());
++    out.extend_from_slice(&crc.to_le_bytes());
++    out.extend_from_slice(kb);
++    out
++}
++
++/// Decode the record starting at byte `off` in `buf`.
++fn decode_at(buf: &[u8], off: usize) -> Decoded {
++    let Some(hdr) = buf.get(off..off + HEADER_LEN) else {
++        return Decoded::Incomplete;
++    };
++    // An all-zero header cannot be a legitimately-encoded record (its crc32c
++    // would not itself be zero), so treat it the same as "not enough bytes" —
++    // the clean end of the log, not corruption.
++    if hdr.iter().all(|&b| b == 0) {
++        return Decoded::Incomplete;
++    }
++    let key_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
++    let offset = u64::from_le_bytes(hdr[4..12].try_into().unwrap());
++    let len = u64::from_le_bytes(hdr[12..20].try_into().unwrap());
++    let crc = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
++    if key_len as usize > MAX_KEY_LEN {
++        return Decoded::Torn;
++    }
++    let total = HEADER_LEN + key_len as usize;
++    let Some(key_bytes) = buf.get(off + HEADER_LEN..off + total) else {
++        return Decoded::Torn;
++    };
++    if record_crc(key_len, offset, len, key_bytes) != crc {
++        return Decoded::Torn;
++    }
++    let Ok(key) = std::str::from_utf8(key_bytes) else {
++        return Decoded::Torn;
++    };
++    Decoded::Record {
++        key: key.to_string(),
++        offset,
++        len,
++        total,
++    }
++}
++
++/// Replay every complete record in `buf` from offset 0, stopping at the first
++/// torn/incomplete one. Returns the rebuilt index (push order preserved, so
++/// per-key spans stay in append order — see `handle_keyed_catchup`) and the
++/// byte length of the valid prefix (`buf.len()` iff there was no torn tail).
++fn replay(buf: &[u8]) -> (HashMap<String, Vec<(u64, u64)>>, usize) {
++    let mut map: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
++    let mut off = 0usize;
++    while let Decoded::Record { key, offset, len, total } = decode_at(buf, off) {
++        map.entry(key).or_default().push((offset, len));
++        off += total;
++    }
++    (map, off)
++}
++
++/// The `.keys` sidecar path for a stream's data file, mirroring
++/// `store::meta_path` (a raw `OsString` suffix append — never
++/// `PathBuf::with_extension`, which would mangle a data file name that itself
++/// contains a literal `.`, e.g. `s+orders.json~5`).
++pub fn key_journal_path(file_path: &Path) -> PathBuf {
++    let mut p = file_path.as_os_str().to_owned();
++    p.push(".keys");
++    PathBuf::from(p)
++}
++
++/// The durable half of a stream's keyed-read index: an append-only file handle
++/// (opened lazily) plus a dirty flag. Always constructed alongside the
++/// in-memory map in `store::KeyDir`, which is the only thing that should call
++/// [`append`](KeyJournal::append) (so the map push and the durable append stay
++/// in lockstep — see that type's docs).
++pub struct KeyJournal {
++    path: PathBuf,
++    file: Option<File>,
++    /// Set when `file` has bytes written since the last fsync.
++    dirty: bool,
++}
++
++impl KeyJournal {
++    /// A stream with no journal file yet — matches a freshly created stream
++    /// (no keyed appends so far). The file is created on the first
++    /// [`append`](KeyJournal::append) call.
++    pub fn empty(file_path: &Path) -> Self {
++        KeyJournal {
++            path: key_journal_path(file_path),
++            file: None,
++            dirty: false,
++        }
++    }
++
++    /// Rebuild the in-memory index from `<file_path>.keys` if it exists, then
++    /// reopen the journal (truncating any torn trailing record first) ready
++    /// for future appends. Never fails: any I/O error reading an existing
++    /// journal degrades to an empty index for this run — the pre-existing
++    /// best-effort-across-restart contract on `key_dir`, just narrower than
++    /// before this module existed (only a read failure, not every restart,
++    /// hits it) — matching how a corrupt `.meta` sidecar is discarded rather
++    /// than aborting boot (see `store::recover`).
++    pub fn recover(file_path: &Path) -> (HashMap<String, Vec<(u64, u64)>>, KeyJournal) {
++        let path = key_journal_path(file_path);
++        let Ok(bytes) = std::fs::read(&path) else {
++            return (HashMap::new(), KeyJournal { path, file: None, dirty: false });
++        };
++        let (map, valid_len) = replay(&bytes);
++        if valid_len < bytes.len() {
++            // Torn trailing record from a crash mid-append: truncate to the
++            // last good boundary, fsync'd immediately (before any new append
++            // can land) so a subsequent append is never separated from replay
++            // by an unreachable gap of garbage a later restart would stop at.
++            if let Ok(f) = OpenOptions::new().write(true).open(&path) {
++                let _ = f.set_len(valid_len as u64);
++                let _ = barrier_fsync(&f);
++            }
++        }
++        let file = OpenOptions::new().append(true).open(&path).ok();
++        (map, KeyJournal { path, file, dirty: false })
++    }
++
++    /// Append one framed record. Buffered — no fsync (see module docs); opens
++    /// the file on the first call for a stream that has never been keyed
++    /// before. Best-effort: an open/write failure just leaves this run's
++    /// index memory-only for the record (matches `key_dir`'s pre-existing
++    /// contract), never fails the append itself.
++    pub fn append(&mut self, key: &str, offset: u64, len: u64) {
++        if self.file.is_none() {
++            self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
++        }
++        let Some(file) = &self.file else { return };
++        let rec = encode(key, offset, len);
++        use std::io::Write;
++        if (&*file).write_all(&rec).is_ok() {
++            self.dirty = true;
++        }
++    }
++
++    /// Fsync the journal iff it has unflushed bytes. Called from
++    /// `store::write_meta_sync`, piggybacking on the sidecar's existing flush
++    /// cadence instead of a dedicated per-append fsync — see the module docs
++    /// for the resulting durability guarantee.
++    pub fn flush_if_dirty(&mut self) {
++        if !self.dirty {
++            return;
++        }
++        if let Some(f) = &self.file {
++            if barrier_fsync(f).is_ok() {
++                self.dirty = false;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn encode_decode_roundtrip() {
++        let rec = encode("orders", 100, 42);
++        match decode_at(&rec, 0) {
++            Decoded::Record { key, offset, len, total } => {
++                assert_eq!(key, "orders");
++                assert_eq!(offset, 100);
++                assert_eq!(len, 42);
++                assert_eq!(total, rec.len());
++            }
++            _ => panic!("expected a decodable record"),
++        }
++    }
++
++    #[test]
++    fn replay_preserves_per_key_push_order() {
++        let mut buf = Vec::new();
++        buf.extend(encode("a", 0, 5));
++        buf.extend(encode("b", 5, 3));
++        buf.extend(encode("a", 8, 7));
++        let (map, valid_len) = replay(&buf);
++        assert_eq!(valid_len, buf.len(), "no torn tail");
++        assert_eq!(map.get("a").unwrap(), &vec![(0, 5), (8, 7)]);
++        assert_eq!(map.get("b").unwrap(), &vec![(5, 3)]);
++    }
++
++    #[test]
++    fn empty_buffer_replays_empty() {
++        let (map, valid_len) = replay(&[]);
++        assert!(map.is_empty());
++        assert_eq!(valid_len, 0);
++    }
++
++    #[test]
++    fn torn_trailing_record_stops_replay_at_last_good_boundary() {
++        let mut buf = Vec::new();
++        buf.extend(encode("a", 0, 5));
++        let good_len = buf.len();
++        // A second record, torn: corrupt its crc byte.
++        let mut torn = encode("b", 5, 9);
++        torn[HEADER_LEN - 1] ^= 0xFF;
++        buf.extend(&torn);
++        let (map, valid_len) = replay(&buf);
++        assert_eq!(valid_len, good_len, "replay must stop before the torn record");
++        assert_eq!(map.len(), 1);
++        assert_eq!(map.get("a").unwrap(), &vec![(0, 5)]);
++    }
++
++    #[test]
++    fn truncated_header_is_incomplete_not_a_record() {
++        let rec = encode("orders", 0, 1);
++        let short = &rec[..HEADER_LEN - 1];
++        assert!(matches!(decode_at(short, 0), Decoded::Incomplete));
++    }
++
++    #[test]
++    fn truncated_key_bytes_are_torn() {
++        let rec = encode("orders", 0, 1);
++        let short = &rec[..rec.len() - 1];
++        assert!(matches!(decode_at(short, 0), Decoded::Torn));
++    }
++
++    fn tmp_data_path(tag: &str) -> PathBuf {
++        use std::time::{SystemTime, UNIX_EPOCH};
++        let dir = std::env::temp_dir().join(format!(
++            "ds-key-journal-{tag}-{}-{}",
++            std::process::id(),
++            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        dir.join("stream-data")
++    }
++
++    #[test]
++    fn recover_with_no_journal_file_is_empty() {
++        let data_path = tmp_data_path("none");
++        let (map, mut journal) = KeyJournal::recover(&data_path);
++        assert!(map.is_empty());
++        // Lazily creates the file on first append, like a fresh stream.
++        journal.append("k", 0, 1);
++        assert!(key_journal_path(&data_path).exists());
++        let _ = std::fs::remove_dir_all(data_path.parent().unwrap());
++    }
++
++    #[test]
++    fn recover_truncates_torn_tail_and_replay_after_reopen_is_gap_free() {
++        let data_path = tmp_data_path("torn");
++        let path = key_journal_path(&data_path);
++        let mut on_disk = Vec::new();
++        on_disk.extend(encode("a", 0, 5));
++        on_disk.extend(encode("b", 5, 3));
++        let good_len = on_disk.len();
++        // Torn trailing bytes: a plausible-looking but truncated third record
++        // (a long enough key that cutting it mid-key actually tears it, unlike
++        // truncating past the end which would be a no-op).
++        let mut torn = encode("cccccccccc", 8, 100);
++        torn.truncate(HEADER_LEN + 3);
++        on_disk.extend(&torn);
++        std::fs::write(&path, &on_disk).unwrap();
++
++        let (map, mut journal) = KeyJournal::recover(&data_path);
++        assert_eq!(map.len(), 2, "torn trailing record must not be indexed");
++        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len as u64, "file truncated to the last good record");
++
++        // A fresh append must land right after the truncated boundary, not
++        // after the (now-removed) garbage — replaying again from scratch must
++        // see exactly the two original records plus the new one, no gap.
++        journal.append("d", 20, 4);
++        let on_disk_now = std::fs::read(&path).unwrap();
++        let (map2, valid_len2) = replay(&on_disk_now);
++        assert_eq!(valid_len2, on_disk_now.len(), "no torn tail after the new append");
++        assert_eq!(map2.len(), 3);
++        assert_eq!(map2.get("d").unwrap(), &vec![(20, 4)]);
++
++        let _ = std::fs::remove_dir_all(data_path.parent().unwrap());
++    }
++}

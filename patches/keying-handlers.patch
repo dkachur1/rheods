@@ -1,0 +1,421 @@
+--- a/src/handlers.rs
++++ b/src/handlers.rs
+@@ -28,6 +28,7 @@
+ const H_FORKED_FROM: &str = "stream-forked-from";
+ const H_FORK_OFFSET: &str = "stream-fork-offset";
+ const H_FORK_SUB_OFFSET: &str = "stream-fork-sub-offset";
++const H_STREAM_KEY: &str = "stream-key";
+ 
+ static LONG_POLL_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+ 
+@@ -161,6 +162,7 @@
+     offset: Option<String>,
+     live: Option<String>,
+     cursor: Option<u64>,
++    key: Option<String>,
+ }
+ 
+ fn parse_query(q: Option<&str>) -> Result<Query, &'static str> {
+@@ -168,6 +170,7 @@
+         offset: None,
+         live: None,
+         cursor: None,
++        key: None,
+     };
+     if let Some(q) = q {
+         for pair in q.split('&') {
+@@ -188,6 +191,7 @@
+                 }
+                 "live" => out.live = Some(v),
+                 "cursor" => out.cursor = v.parse().ok(),
++                "key" => out.key = Some(v),
+                 _ => {}
+             }
+         }
+@@ -912,6 +916,7 @@
+     let close_req = header_is_true(&req, H_CLOSED);
+     let seq_header = header_str(&req, H_SEQ).map(|s| s.to_string());
+     let req_ct = header_str(&req, "content-type").map(|s| s.to_string());
++    let stream_key = header_str(&req, H_STREAM_KEY).map(|s| s.to_string());
+ 
+     let body = req.body.clone();
+ 
+@@ -1133,6 +1138,15 @@
+     // readers, mirroring the close-visibility ordering below.
+     if let Some(t) = new_tail {
+         publish_durable_tail(&st, t, &wire);
++    }
++
++    // Record this append in the keyed-read directory only now that it is durable
++    // (same visibility ordering as `publish_durable_tail` above) — a keyed reader
++    // must never be able to observe an offset a crash could still roll back.
++    if let Some(k) = &stream_key {
++        if !wire.is_empty() {
++            st.record_keyed_append(k, stream_offset, wire.len() as u64);
++        }
+     }
+ 
+     // Closure ordering: WAL fsync → durable meta commit → expose the closure to
+@@ -1257,6 +1271,13 @@
+     if header_is_true(req, H_CLOSED) || content_len == 0 {
+         return ZeroCopyOutcome::Fallback;
+     }
++    // A keyed append must go through the buffered path: only `handle_append_inner`
++    // records the durable span into `st.key_dir`. Without this guard a keyed
++    // append here would ack normally but never be visible to a keyed read — a
++    // silent (not erroring) gap, worse than the cost of falling back.
++    if header_str(req, H_STREAM_KEY).is_some() {
++        return ZeroCopyOutcome::Fallback;
++    }
+     let producer = match parse_producer_headers(req) {
+         Ok(p) => p,
+         Err(_) => return ZeroCopyOutcome::Fallback,
+@@ -1619,19 +1640,23 @@
+     if live.is_some() && q.offset.is_none() {
+         return text_response(400, "offset is required for live modes");
+     }
++    // A routing key composes with every read mode: catch-up (`handle_keyed_catchup`)
++    // and now live long-poll/SSE (`long_poll_data` / `handle_sse`'s wake loop) all
++    // gather through the shared `gather_keyed_bytes` helper.
++    let key = q.key.as_deref();
+     let t0 = crate::telemetry::Timer::start();
+     let mut cache_hit = false;
+     let (resp, live_label) = match live {
+         Some("long-poll") => (
+-            handle_long_poll(st, offset, q.cursor, &mut cache_hit).await,
++            handle_long_poll(st, offset, q.cursor, key, &mut cache_hit).await,
+             "long-poll",
+         ),
+         // SSE records its own read metric per emitted batch (streaming, no single
+         // dispatch latency); the dispatch here just sets up the channel.
+-        Some("sse") => return handle_sse(st, offset, q.cursor).await,
++        Some("sse") => return handle_sse(st, offset, q.cursor, key.map(str::to_string)).await,
+         Some(_) => return text_response(400, "invalid live mode"),
+         None => (
+-            handle_catchup(st, offset, &req, &mut cache_hit).await,
++            handle_catchup(st, offset, &req, key, &mut cache_hit).await,
+             "catchup",
+         ),
+     };
+@@ -1693,6 +1718,7 @@
+     st: Arc<StreamState>,
+     offset: ParsedOffset,
+     req: &Req,
++    key: Option<&str>,
+     cache_hit: &mut bool,
+ ) -> Resp {
+     let t = st.tail();
+@@ -1702,6 +1728,9 @@
+         next_offset,
+     } = resolve_start(offset, t.bytes);
+     let end = t.bytes;
++    if let Some(key) = key {
++        return handle_keyed_catchup(&st, key, start, end, t).await;
++    }
+     // In sentinel mode (offset=now or a beyond-tail offset) the range is empty
+     // (`start == end == tail`); report the resolved next offset — the requested
+     // offset for a beyond-tail read (PROTOCOL.md §5.5). Otherwise report the
+@@ -1734,6 +1763,106 @@
+     if let Some(etag) = etag {
+         b = b.h("etag", etag);
+     }
++    if t.closed {
++        b = b.hs(H_CLOSED, "true");
++    }
++    b.body(body)
++}
++
++/// Coalesce gap for keyed reads: same-key spans separated by <= this many bytes
++/// are merged into one contiguous read (reading-and-discarding the interleaved
++/// other-key bytes is cheaper than a second read setup). Caps wasted bytes read
++/// on a sparsely-multiplexed large log; matches the cold local read window.
++const KEYED_COALESCE_GAP: u64 = COLD_LOCAL_WINDOW as u64;
++
++/// Read `[a, b)` into a materialized buffer, resident-tail-cache FIRST — the hot
++/// path the plain `read_range_bytes` skips. Just-appended / caught-up data lives
++/// in the shared resident chunk, so a keyed read of recent data is one memory
++/// copy, not a file read; only a range that has fallen out of the resident chunk
++/// falls back to segment resolution (local fds / remote objects).
++async fn read_region_bytes(st: &Arc<StreamState>, a: u64, b: u64) -> std::io::Result<Bytes> {
++    if let Some(bytes) = st.tail_chunk_slice(a, b) {
++        return Ok(bytes);
++    }
++    read_range_bytes(st, a, b).await
++}
++
++/// Gather every durable append recorded under `key` in `st.key_dir` whose
++/// (pre-append) offset falls in `[start, end)` and concatenate their raw wire
++/// bytes in append order. Each recorded span is the exact wire bytes of one
++/// durable append (see `handle_append_inner`), so a simple per-span offset
++/// filter is correct — no partial-span overlap is possible.
++///
++/// Serve like the reference servers do for filtered reads (see the ported
++/// technique notes): rather than one read syscall per scattered span, COALESCE
++/// spans separated by < KEYED_COALESCE_GAP into a single contiguous read, read
++/// that range ONCE (resident-cache first via `read_region_bytes` — the hot path
++/// the plain `read_range_bytes` misses), then copy out just the kept spans from
++/// the in-memory buffer. Turns N tiny reads into a few contiguous ones; the gap
++/// cap bounds the interleaved bytes read-and-discarded on a sparse large log.
++///
++/// Shared by keyed catch-up (`handle_keyed_catchup`) and keyed live reads
++/// (`long_poll_data`, `handle_sse`) — the one place span filtering + coalescing
++/// + resident-cache-first reads live, so the read paths can't drift apart.
++async fn gather_keyed_bytes(st: &Arc<StreamState>, key: &str, start: u64, end: u64) -> std::io::Result<Bytes> {
++    let spans: Vec<(u64, u64)> = st.keyed_spans(key, start, end);
++    let mut buf = BytesMut::new();
++    let mut i = 0;
++    while i < spans.len() {
++        let r_start = spans[i].0;
++        let mut r_end = spans[i].0 + spans[i].1;
++        let mut j = i + 1;
++        while j < spans.len() && spans[j].0.saturating_sub(r_end) <= KEYED_COALESCE_GAP {
++            r_end = spans[j].0 + spans[j].1;
++            j += 1;
++        }
++        // A short/failed read must not be silently forwarded as a (wrongly)
++        // shorter but well-formed body — propagate the error to the caller.
++        let region = read_region_bytes(st, r_start, r_end).await?;
++        for &(off, len) in &spans[i..j] {
++            let lo = (off - r_start) as usize;
++            buf.put_slice(&region[lo..lo + len as usize]);
++        }
++        i = j;
++    }
++    Ok(buf.freeze())
++}
++
++/// Wrap gathered keyed bytes (`gather_keyed_bytes`) into a response body. Every
++/// recorded span is `encode_wire`'s JSON output, which always ends in a
++/// trailing `,` — for JSON streams strip the last one and wrap once (not
++/// per-span) into a single `[...]` array; binary streams pass the concatenated
++/// bytes through unchanged.
++fn wrap_keyed_body(st: &StreamState, buf: Bytes) -> Body {
++    if st.is_json {
++        let mut out = BytesMut::with_capacity(buf.len() + 2);
++        out.put_u8(b'[');
++        if !buf.is_empty() {
++            out.put_slice(&buf[..buf.len() - 1]);
++        }
++        out.put_u8(b']');
++        Body::Full(out.freeze())
++    } else {
++        Body::Full(buf)
++    }
++}
++
++/// Keyed catch-up read over `[start, end)` (`gather_keyed_bytes` + `wrap_keyed_body`).
++///
++/// Not a cacheable byte range (it's a filtered projection, not `[start, end)`
++/// verbatim), so unlike the unkeyed path: no ETag, and `Cache-Control: no-store`
++/// unconditionally.
++async fn handle_keyed_catchup(st: &Arc<StreamState>, key: &str, start: u64, end: u64, t: Tail) -> Resp {
++    let buf = match gather_keyed_bytes(st, key, start, end).await {
++        Ok(b) => b,
++        Err(_) => return text_response(500, "keyed read failed"),
++    };
++    let body = wrap_keyed_body(st, buf);
++    let mut b = ResponseBuilder::new(200)
++        .h("content-type", st.config.content_type.clone())
++        .h(H_NEXT_OFFSET, format_offset(end))
++        .hs(H_UP_TO_DATE, "true")
++        .hs("cache-control", "no-store");
+     if t.closed {
+         b = b.hs(H_CLOSED, "true");
+     }
+@@ -1744,6 +1873,7 @@
+     st: Arc<StreamState>,
+     offset: ParsedOffset,
+     client_cursor: Option<u64>,
++    key: Option<&str>,
+     cache_hit: &mut bool,
+ ) -> Resp {
+     let t0 = st.tail();
+@@ -1755,20 +1885,24 @@
+     // Existing data → return immediately. This is a backlog (the consumer was
+     // behind the tail), so it may include cold historical bytes: not hot.
+     if from < t0.bytes {
+-        return long_poll_data(&st, from, t0, client_cursor, false, cache_hit).await;
++        return long_poll_data(&st, from, t0, client_cursor, key, false, cache_hit).await;
+     }
+     if t0.closed {
+         return long_poll_close(t0.bytes, cursor);
+     }
+ 
+-    // Wait for new data / closure / timeout.
++    // Wait for new data / closure / timeout. Unchanged for a keyed reader: it
++    // wakes on ANY new append (not just its key's), then `long_poll_data` below
++    // filters — a wake with no matching bytes still returns a (possibly empty)
++    // response that advances Stream-Next-Offset past the other key's data,
++    // rather than looping again inside this call.
+     let mut rx = st.tail_tx.subscribe();
+     let deadline = Instant::now() + long_poll_timeout_dur();
+     loop {
+         let t = *rx.borrow_and_update();
+         if t.bytes > from {
+             // Caught-up consumer woken by new appends: freshly-written, hot.
+-            return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
++            return long_poll_data(&st, from, t, client_cursor, key, true, cache_hit).await;
+         }
+         if t.closed {
+             return long_poll_close(t.bytes, cursor);
+@@ -1778,7 +1912,7 @@
+                 if r.is_err() {
+                     let t = st.tail();
+                     if t.bytes > from {
+-                        return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
++                        return long_poll_data(&st, from, t, client_cursor, key, true, cache_hit).await;
+                     }
+                     return long_poll_timeout(t.bytes, cursor, t.closed);
+                 }
+@@ -1796,18 +1930,42 @@
+     from: u64,
+     t: Tail,
+     client_cursor: Option<u64>,
++    key: Option<&str>,
+     hot: bool,
+     cache_hit: &mut bool,
+ ) -> Resp {
+     let cursor = compute_cursor(client_cursor);
+-    let body = read_range_body(st, from, t.bytes, hot, "long-poll", cache_hit).await;
++    let Some(key) = key else {
++        let body = read_range_body(st, from, t.bytes, hot, "long-poll", cache_hit).await;
++        let mut b = ResponseBuilder::new(200)
++            .h("content-type", st.config.content_type.clone())
++            .h(H_NEXT_OFFSET, format_offset(t.bytes))
++            .h(H_CURSOR, cursor.to_string())
++            .h("etag", st.etag(from, t.bytes, t.closed))
++            .hs(H_UP_TO_DATE, "true")
++            .hs("cache-control", CACHEABLE);
++        if t.closed {
++            b = b.hs(H_CLOSED, "true");
++        }
++        return b.body(body);
++    };
++    // Keyed long-poll: same wake/backlog path above, but the body is a filtered
++    // projection (`gather_keyed_bytes`) rather than a verbatim byte range — not
++    // cacheable, so no ETag / no-store, matching `handle_keyed_catchup`.
++    // Stream-Next-Offset is still the underlying tail `t.bytes` (never clamped
++    // to the key's last match), so the reader always advances past other keys'
++    // data instead of re-scanning it on the next long-poll.
++    let buf = match gather_keyed_bytes(st, key, from, t.bytes).await {
++        Ok(b) => b,
++        Err(_) => return text_response(500, "keyed read failed"),
++    };
++    let body = wrap_keyed_body(st, buf);
+     let mut b = ResponseBuilder::new(200)
+         .h("content-type", st.config.content_type.clone())
+         .h(H_NEXT_OFFSET, format_offset(t.bytes))
+         .h(H_CURSOR, cursor.to_string())
+-        .h("etag", st.etag(from, t.bytes, t.closed))
+         .hs(H_UP_TO_DATE, "true")
+-        .hs("cache-control", CACHEABLE);
++        .hs("cache-control", "no-store");
+     if t.closed {
+         b = b.hs(H_CLOSED, "true");
+     }
+@@ -1885,7 +2043,16 @@
+     out.push_str("}\n\n");
+ }
+ 
+-async fn handle_sse(st: Arc<StreamState>, offset: ParsedOffset, client_cursor: Option<u64>) -> Resp {
++/// `key`, when set, filters every emitted `data` event to that routing key
++/// (via `gather_keyed_bytes`, shared with catch-up/long-poll) while advancing
++/// `pos`/`Stream-Next-Offset` on every wake regardless of match — see the wake
++/// loop below.
++async fn handle_sse(
++    st: Arc<StreamState>,
++    offset: ParsedOffset,
++    client_cursor: Option<u64>,
++    key: Option<String>,
++) -> Resp {
+     let t0 = st.tail();
+     // A beyond-tail numeric offset starts caught-up at the tail (see
+     // `resolve_start`): emit the initial up-to-date control event, then wait.
+@@ -1914,45 +2081,56 @@
+             if t.bytes > pos {
+                 // Read new range and emit data + control. Caught-up subscribers
+                 // share the resident tail chunk — one read for all of them —
+-                // and fall back to a file read only when behind it.
++                // and fall back to a file read only when behind it. A keyed
++                // reader instead gathers just its key's spans (`gather_keyed_bytes`,
++                // shared with catch-up/long-poll) over the same new range —
++                // resident-cache-first per coalesced region, just filtered.
+                 let read_t0 = crate::telemetry::Timer::start();
+-                let cache_hit;
+-                let data = match st.tail_chunk_slice(pos, t.bytes) {
+-                    Some(b) => {
+-                        cache_hit = true;
+-                        b
+-                    }
+-                    None => {
+-                        cache_hit = false;
+-                        match read_range_bytes(&st, pos, t.bytes).await {
+-                            Ok(d) => d,
++                let (data, cache_hit) = match &key {
++                    None => match st.tail_chunk_slice(pos, t.bytes) {
++                        Some(b) => (b, true),
++                        None => match read_range_bytes(&st, pos, t.bytes).await {
++                            Ok(d) => (d, false),
+                             // End the stream without advancing `pos`: the client
+                             // reconnects from its last offset, never skipping a gap.
+                             Err(_) => return,
+-                        }
+-                    }
++                        },
++                    },
++                    // A gather can span several coalesced regions, so a single
++                    // hit/miss bit doesn't map cleanly onto it — record it as a
++                    // miss (telemetry only, no correctness effect).
++                    Some(k) => match gather_keyed_bytes(&st, k, pos, t.bytes).await {
++                        Ok(b) => (b, false),
++                        Err(_) => return,
++                    },
+                 };
+                 crate::telemetry::record_tail_cache(cache_hit, "sse");
+                 crate::telemetry::record_read(read_t0.elapsed_secs(), "sse", cache_hit);
+                 let mut ev = String::new();
+-                match sse_encoding(&st) {
+-                    SseEncoding::Json => {
+-                        // wire bytes end with ','; wrap as array
+-                        let inner = &data[..data.len().saturating_sub(1)];
+-                        let mut payload = String::with_capacity(inner.len() + 2);
+-                        payload.push('[');
+-                        payload.push_str(&String::from_utf8_lossy(inner));
+-                        payload.push(']');
+-                        sse_data_event(&mut ev, &payload);
+-                    }
+-                    SseEncoding::Text => {
+-                        sse_data_event(&mut ev, &String::from_utf8_lossy(&data));
+-                    }
+-                    SseEncoding::Base64 => {
+-                        sse_data_event(
+-                            &mut ev,
+-                            &crate::api::base64_encode(&data, crate::api::BASE64_STD, true),
+-                        );
++                // A keyed wake can have no bytes for this key (the new range was
++                // all other keys) — emit no `data` event, but still advance `pos`
++                // and emit the control event below so the reader's next-offset
++                // moves past it instead of re-scanning the same range.
++                if !data.is_empty() {
++                    match sse_encoding(&st) {
++                        SseEncoding::Json => {
++                            // wire bytes end with ','; wrap as array
++                            let inner = &data[..data.len().saturating_sub(1)];
++                            let mut payload = String::with_capacity(inner.len() + 2);
++                            payload.push('[');
++                            payload.push_str(&String::from_utf8_lossy(inner));
++                            payload.push(']');
++                            sse_data_event(&mut ev, &payload);
++                        }
++                        SseEncoding::Text => {
++                            sse_data_event(&mut ev, &String::from_utf8_lossy(&data));
++                        }
++                        SseEncoding::Base64 => {
++                            sse_data_event(
++                                &mut ev,
++                                &crate::api::base64_encode(&data, crate::api::BASE64_STD, true),
++                            );
++                        }
+                     }
+                 }
+                 pos = t.bytes;
