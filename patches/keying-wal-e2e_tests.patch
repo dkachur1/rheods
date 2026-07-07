@@ -38,10 +38,14 @@
  /// Create a stream over the REAL HTTP path; assert a 2xx.
  async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
      let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
-@@ -864,3 +895,387 @@
- 
-     let _ = std::fs::remove_dir_all(&dir);
- }
+@@ -860,7 +891,454 @@
+         st.tail().bytes,
+         b"survive-me".len() as u64,
+         "recovered tail == appended bytes"
++    );
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
 +
 +// ===========================================================================
 +// (9) KEYED CATCH-UP READS (`Stream-Key` append directory + `?key=` reads)
@@ -88,6 +92,69 @@
 +    match resp_b.body {
 +        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"BBBB")),
 +        _ => panic!("expected a Body::Full for a keyed catch-up read"),
++    }
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// A `Stream-Key` set on the fork-create request (the fork trio + `stream-key`
++/// in ONE request) makes the forked stream immediately routable by that key: a
++/// `?key=` read returns the forked stream's content (the inherited parent
++/// prefix, resolved through the fork chain), and a subsequent keyed append with
++/// the same key routes to this same stream and extends the `?key=` result — same
++/// semantics as if the key had been established via a normal keyed append.
++#[tokio::test]
++async fn e2e_fork_create_with_stream_key_is_keyed_routable() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("fork-keyed-create");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    // Parent with content so the fork inherits a non-empty prefix.
++    create_stream(&h.store, "parent", OCTET).await;
++    append_acked(&h.store, "parent", OCTET, b"0123456789").await; // tail = 10
++
++    // Fork at offset 5 AND set the routing key in the same create request.
++    let key = "conv1";
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        put_req(
++            "child",
++            OCTET,
++            b"",
++            &[
++                ("stream-forked-from", "parent"),
++                ("stream-fork-offset", &fork_offset(5)),
++                ("stream-key", key),
++            ],
++        ),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "fork+key create got {}", resp.status);
++
++    // `?key=` returns the forked stream's content: the inherited `[0, 5)` prefix,
++    // read through the parent chain.
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("child", Some("key=conv1"))).await;
++    assert_eq!(resp.status, 200, "keyed read of forked stream must 200");
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"01234")),
++        _ => panic!("expected a Body::Full for a keyed read"),
++    }
++
++    // A later keyed append with the same key routes to this forked stream and
++    // extends the key's result.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("child", OCTET, b"XYZ", &[("stream-key", key)]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "keyed append to fork got {}", resp.status);
++
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("child", Some("key=conv1"))).await;
++    assert_eq!(resp.status, 200);
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"01234XYZ")),
++        _ => panic!("expected a Body::Full for a keyed read"),
 +    }
 +
 +    h.crash();
@@ -325,7 +392,7 @@
 +        resp_header(&resp1, "stream-next-offset"),
 +        Some(next1.as_str()),
 +        "next-offset must advance to the underlying tail even with no key match"
-+    );
+     );
 +    assert_eq!(resp_header(&resp1, "stream-up-to-date"), Some("true"));
 +    assert_eq!(resp_header(&resp1, "cache-control"), Some("no-store"));
 +    assert!(resp_header(&resp1, "etag").is_none(), "keyed live read must not carry an ETag");
@@ -333,7 +400,7 @@
 +        crate::api::Body::Full(b) => assert!(b.is_empty(), "key=a must not see key b's bytes"),
 +        _ => panic!("expected a Body::Full for a keyed long-poll read"),
 +    }
-+
+ 
 +    // Second long-poll: from the advanced offset (4), parked again.
 +    let store2 = Arc::clone(&h.store);
 +    let poll2 = tokio::spawn(async move {
@@ -363,8 +430,8 @@
 +    }
 +
 +    h.crash();
-+    let _ = std::fs::remove_dir_all(&dir);
-+}
+     let _ = std::fs::remove_dir_all(&dir);
+ }
 +
 +/// A keyed SSE subscriber emits only its key's bytes as `data` events; a wake
 +/// whose new bytes were all another key's still advances `pos` (so the next

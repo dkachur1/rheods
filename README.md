@@ -40,11 +40,12 @@ with `bench/bun/linux/build-and-run.sh`, details in `bench/bun/linux/RESULTS.md`
 ## Features
 
 - **`Stream-Key` on append + `?key=` filtered reads** — isolate one conversation; composes with `?offset=`.
+- **`Stream-Key` on fork-create** — set the key in the same request as the fork trio (`Stream-Forked-From` / `-Fork-Offset` / `-Fork-Sub-Offset`); the new branch is `?key=`-routable at birth (its inherited prefix resolves through the fork chain) and later keyed appends route to it — no separate priming append needed.
 - **Fast** — coalesced spans + resident-cache-first serving (see [Benchmarks](#benchmarks)).
 - **Durable at ack** — a per-stream `.keys` journal fsyncs before the append is acked; rebuilt on restart. No crash-tail window.
 - **Live** — keyed long-poll + SSE; a reader advances past other keys' data.
 - **Real-client verified** — `@durable-streams/state`'s `createStreamDB` folds a `?key=` read into just that conversation's rows.
-- **101 tests** (87 upstream + keying / persistence / live / journal); patch set verified to apply clean and compile.
+- **102 tests** (87 upstream + keying / fork-keying / persistence / live / journal); patch set verified to apply clean and compile.
 
 ## How it works
 
