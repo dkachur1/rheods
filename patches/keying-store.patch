@@ -14,7 +14,7 @@
  }
  
  /// Crash-recovery intent for a live-file compaction in progress. While set, the
-@@ -309,8 +316,70 @@
+@@ -309,8 +316,108 @@
              format!("\"{}:{}:{}:c\"", self.id, start, end)
          } else {
              format!("\"{}:{}:{}\"", self.id, start, end)
@@ -39,6 +39,44 @@
 +        // deferred `write_meta_sync` flush remains as a backstop (a no-op once
 +        // this has already cleared the dirty flag).
 +        kd.journal.flush_if_dirty();
++    }
++
++    /// In-stream keyed fork: seed `dest_key` from the first `cut` spans recorded
++    /// under `src_key` (append order), copying their `(offset, len)` verbatim
++    /// into `dest_key`'s directory in THIS same stream. The inherited bytes
++    /// already live here, so a later `?key=dest_key` read gathers them directly
++    /// (`keyed_spans` → `gather_keyed_bytes`) — no new stream, no fork parent
++    /// chain — and subsequent keyed appends under `dest_key` extend it (their
++    /// higher offsets keep the directory offset-ordered, which
++    /// `handle_keyed_catchup`'s coalescing scan relies on). This is the
++    /// multiplexed one-stream-per-namespace fork: forking a conversation KEY out
++    /// of the shared stream, not forking a whole parent stream by path.
++    ///
++    /// `cut == None` inherits all of `src_key`'s spans; a `cut` past the span
++    /// count inherits all of them. Durable — the copied entries are journaled and
++    /// fsync'd once before returning, same guarantee as `record_keyed_append`.
++    /// Returns the number of spans inherited.
++    pub fn fork_key(&self, src_key: &str, dest_key: &str, cut: Option<usize>) -> usize {
++        let mut kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
++        let src_spans: Vec<(u64, u64)> = match kd.map.get(src_key) {
++            Some(v) => {
++                let take = cut.unwrap_or(v.len()).min(v.len());
++                v[..take].to_vec()
++            }
++            None => Vec::new(),
++        };
++        if src_spans.is_empty() {
++            return 0;
++        }
++        {
++            let dest = kd.map.entry(dest_key.to_string()).or_default();
++            dest.extend_from_slice(&src_spans);
++        }
++        for (off, len) in &src_spans {
++            kd.journal.append(dest_key, *off, *len);
++        }
++        kd.journal.flush_if_dirty();
++        src_spans.len()
 +    }
 +
 +    /// Exact `(offset, len)` spans recorded under `key` whose offset falls in
@@ -85,7 +123,7 @@
  }
  
  pub struct Store {
-@@ -388,6 +457,7 @@
+@@ -388,6 +495,7 @@
      fn recover(&self, streams_dir: &std::path::Path) -> std::io::Result<()> {
          let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
          let mut data_files: Vec<PathBuf> = Vec::new();
@@ -93,7 +131,7 @@
          for entry in std::fs::read_dir(streams_dir)? {
              let p = entry?.path();
              let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-@@ -399,6 +469,14 @@
+@@ -399,6 +507,14 @@
                  // durable residual for a pending intent, else removed there). Do
                  // NOT treat it as an orphan data file — that would delete the
                  // durable residual before recovery can promote it.
@@ -108,7 +146,7 @@
              } else if name.ends_with(".meta") {
                  let data_path = PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
                  if data_path.exists() {
-@@ -417,6 +495,14 @@
+@@ -417,6 +533,14 @@
          // Drop orphan data files (no usable sidecar).
          for p in data_files {
              if !metas.values().any(|(_, dp)| *dp == p) {
@@ -123,7 +161,7 @@
                  let _ = std::fs::remove_file(&p);
              }
          }
-@@ -577,6 +663,8 @@
+@@ -577,6 +701,8 @@
              // the file size each boot (see `file_base` above), so the in-memory
              // cell starts clear; the next meta write persists the cleared marker.
              compaction: StdMutex::new(None),
@@ -132,7 +170,7 @@
              config: StreamConfig {
                  content_type: meta.content_type.clone(),
                  ttl_seconds: meta.ttl_seconds,
-@@ -638,6 +726,7 @@
+@@ -638,6 +764,7 @@
              let fp = st.file_path.clone();
              tokio::task::spawn_blocking(move || {
                  let _ = std::fs::remove_file(meta_path(&fp));
@@ -140,7 +178,7 @@
                  let _ = std::fs::remove_file(fp);
              });
              self.release_parent(st);
-@@ -668,6 +757,7 @@
+@@ -668,6 +795,7 @@
              let fp = parent.file_path.clone();
              tokio::task::spawn_blocking(move || {
                  let _ = std::fs::remove_file(meta_path(&fp));
@@ -148,7 +186,7 @@
                  let _ = std::fs::remove_file(fp);
              });
              cur = parent.parent.clone();
-@@ -709,6 +799,8 @@
+@@ -709,6 +837,8 @@
              bytes: base_offset,
              closed,
          });
@@ -157,7 +195,7 @@
          let state = Arc::new(StreamState {
              id,
              path: path.to_string(),
-@@ -738,6 +830,7 @@
+@@ -738,6 +868,7 @@
              tier: crate::tier::TierState::default(),
              blobstore: self.blobstore.clone(),
              compaction: StdMutex::new(None),
@@ -165,7 +203,7 @@
              config,
          });
          match self.streams.entry(path.to_string()) {
-@@ -1024,6 +1117,15 @@
+@@ -1024,6 +1155,15 @@
      if durable {
          fsync_parent_dir(&final_path)?;
      }

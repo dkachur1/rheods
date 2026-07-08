@@ -44,7 +44,49 @@
  
      // ---- fork header parsing & validation ----
      let forked_from = header_str(&req, H_FORKED_FROM).map(|s| s.to_string());
-@@ -608,6 +617,18 @@
+@@ -422,6 +431,41 @@
+             }
+         }
+     };
++    // ---- in-stream keyed fork ----
++    // The multiplexed one-stream-per-namespace fork: `Stream-Forked-From` names a
++    // source KEY *within an already-existing target stream* (not a whole parent
++    // stream by path), and `Stream-Key` names the new branch key. We seed the
++    // branch key from the source key's first `Stream-Fork-Sub-Offset` spans (a
++    // count into the source key's own append sequence; omitted = inherit all) so
++    // a later `?key=<branch>` read returns the source's rows strictly before the
++    // cut, and keyed appends under the branch extend it — no new stream, no
++    // `Stream-Fork-Offset` (the inherited bytes already live in this stream).
++    //
++    // Detected by: the target path already exists AND both keys are set. A
++    // path-level fork (source is a *different* stream, target path is *new*)
++    // still falls through to the byte-prefix path below — `store.get(path)` is
++    // None for a not-yet-created target, so this never shadows it.
++    if let (Some(src_key), Some(dest_key)) = (forked_from.as_deref(), stream_key.as_deref()) {
++        if let Some(st) = store.get(&path) {
++            if st.shared.read().unwrap().soft_deleted {
++                return text_response(409, "fork source is deleted");
++            }
++            st.fork_key(src_key, dest_key, sub_offset.map(|n| n as usize));
++            let t = st.tail();
++            let mut b = ResponseBuilder::new(201)
++                .h(
++                    "location",
++                    format!("http://{}{}", host.as_deref().unwrap_or("localhost"), st.path),
++                )
++                .h("content-type", st.config.content_type.clone())
++                .h(H_NEXT_OFFSET, format_offset(t.bytes));
++            if t.closed {
++                b = b.hs(H_CLOSED, "true");
++            }
++            return b.body(empty());
++        }
++    }
++
+     if sub_offset.unwrap_or(0) > 0 && fork_offset_raw.is_none() {
+         return text_response(
+             400,
+@@ -608,6 +652,18 @@
                  // Durable now (wal) / page-cache written (memory): expose to readers.
                  publish_durable_tail(&st, new_tail, &wire);
              }
@@ -63,7 +105,7 @@
              let t = st.tail();
              let mut b = ResponseBuilder::new(201)
                  .h("location", format!("http://{}{}", host.as_deref().unwrap_or("localhost"), st.path))
-@@ -912,6 +933,7 @@
+@@ -912,6 +968,7 @@
      let close_req = header_is_true(&req, H_CLOSED);
      let seq_header = header_str(&req, H_SEQ).map(|s| s.to_string());
      let req_ct = header_str(&req, "content-type").map(|s| s.to_string());
@@ -71,7 +113,7 @@
  
      let body = req.body.clone();
  
-@@ -1135,6 +1157,15 @@
+@@ -1135,6 +1192,15 @@
          publish_durable_tail(&st, t, &wire);
      }
  
@@ -87,21 +129,21 @@
      // Closure ordering: WAL fsync → durable meta commit → expose the closure to
      // readers (closed_durable) and wake waiters. Readers never observe EOF for a
      // closure that is not yet durable (PROTOCOL.md §4.1).
-@@ -1255,6 +1286,13 @@
-     // A close request, an empty body, or producer headers that don't parse are
-     // all handled by the buffered path. Likewise any explicit close.
+@@ -1257,6 +1323,13 @@
      if header_is_true(req, H_CLOSED) || content_len == 0 {
-+        return ZeroCopyOutcome::Fallback;
-+    }
+         return ZeroCopyOutcome::Fallback;
+     }
 +    // A keyed append must go through the buffered path: only `handle_append_inner`
 +    // records the durable span into `st.key_dir`. Without this guard a keyed
 +    // append here would ack normally but never be visible to a keyed read — a
 +    // silent (not erroring) gap, worse than the cost of falling back.
 +    if header_str(req, H_STREAM_KEY).is_some() {
-         return ZeroCopyOutcome::Fallback;
-     }
++        return ZeroCopyOutcome::Fallback;
++    }
      let producer = match parse_producer_headers(req) {
-@@ -1619,19 +1657,23 @@
+         Ok(p) => p,
+         Err(_) => return ZeroCopyOutcome::Fallback,
+@@ -1619,19 +1692,23 @@
      if live.is_some() && q.offset.is_none() {
          return text_response(400, "offset is required for live modes");
      }
@@ -128,7 +170,7 @@
              "catchup",
          ),
      };
-@@ -1693,6 +1735,7 @@
+@@ -1693,6 +1770,7 @@
      st: Arc<StreamState>,
      offset: ParsedOffset,
      req: &Req,
@@ -136,7 +178,7 @@
      cache_hit: &mut bool,
  ) -> Resp {
      let t = st.tail();
-@@ -1702,6 +1745,9 @@
+@@ -1702,6 +1780,9 @@
          next_offset,
      } = resolve_start(offset, t.bytes);
      let end = t.bytes;
@@ -146,10 +188,15 @@
      // In sentinel mode (offset=now or a beyond-tail offset) the range is empty
      // (`start == end == tail`); report the resolved next offset — the requested
      // offset for a beyond-tail read (PROTOCOL.md §5.5). Otherwise report the
-@@ -1738,12 +1784,113 @@
-         b = b.hs(H_CLOSED, "true");
-     }
-     b.body(body)
+@@ -1733,7 +1814,107 @@
+         );
+     if let Some(etag) = etag {
+         b = b.h("etag", etag);
++    }
++    if t.closed {
++        b = b.hs(H_CLOSED, "true");
++    }
++    b.body(body)
 +}
 +
 +/// Coalesce gap for keyed reads: same-key spans separated by <= this many bytes
@@ -168,8 +215,8 @@
 +        return Ok(bytes);
 +    }
 +    read_range_bytes(st, a, b).await
- }
- 
++}
++
 +/// Gather every durable append recorded under `key` in `st.key_dir` whose
 +/// (pre-append) offset falls in `[start, end)` and concatenate their raw wire
 +/// bytes in append order. Each recorded span is the exact wire bytes of one
@@ -227,7 +274,7 @@
 +        Body::Full(out.freeze())
 +    } else {
 +        Body::Full(buf)
-+    }
+     }
 +}
 +
 +/// Keyed catch-up read over `[start, end)` (`gather_keyed_bytes` + `wrap_keyed_body`).
@@ -246,13 +293,10 @@
 +        .h(H_NEXT_OFFSET, format_offset(end))
 +        .hs(H_UP_TO_DATE, "true")
 +        .hs("cache-control", "no-store");
-+    if t.closed {
-+        b = b.hs(H_CLOSED, "true");
-+    }
-+    b.body(body)
-+}
-+
- async fn handle_long_poll(
+     if t.closed {
+         b = b.hs(H_CLOSED, "true");
+     }
+@@ -1744,6 +1925,7 @@
      st: Arc<StreamState>,
      offset: ParsedOffset,
      client_cursor: Option<u64>,
@@ -260,7 +304,7 @@
      cache_hit: &mut bool,
  ) -> Resp {
      let t0 = st.tail();
-@@ -1755,20 +1902,24 @@
+@@ -1755,20 +1937,24 @@
      // Existing data → return immediately. This is a backlog (the consumer was
      // behind the tail), so it may include cold historical bytes: not hot.
      if from < t0.bytes {
@@ -288,7 +332,7 @@
          }
          if t.closed {
              return long_poll_close(t.bytes, cursor);
-@@ -1778,7 +1929,7 @@
+@@ -1778,7 +1964,7 @@
                  if r.is_err() {
                      let t = st.tail();
                      if t.bytes > from {
@@ -297,7 +341,7 @@
                      }
                      return long_poll_timeout(t.bytes, cursor, t.closed);
                  }
-@@ -1796,18 +1947,42 @@
+@@ -1796,18 +1982,42 @@
      from: u64,
      t: Tail,
      client_cursor: Option<u64>,
@@ -343,7 +387,7 @@
      if t.closed {
          b = b.hs(H_CLOSED, "true");
      }
-@@ -1885,7 +2060,16 @@
+@@ -1885,7 +2095,16 @@
      out.push_str("}\n\n");
  }
  
@@ -361,7 +405,7 @@
      let t0 = st.tail();
      // A beyond-tail numeric offset starts caught-up at the tail (see
      // `resolve_start`): emit the initial up-to-date control event, then wait.
-@@ -1914,45 +2098,56 @@
+@@ -1914,45 +2133,56 @@
              if t.bytes > pos {
                  // Read new range and emit data + control. Caught-up subscribers
                  // share the resident tail chunk — one read for all of them —

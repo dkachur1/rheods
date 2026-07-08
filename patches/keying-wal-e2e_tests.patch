@@ -1,9 +1,12 @@
 --- a/src/wal/e2e_tests.rs
 +++ b/src/wal/e2e_tests.rs
-@@ -118,6 +118,37 @@
-     }
- }
- 
+@@ -115,9 +115,40 @@
+         query: None,
+         headers: vec![("content-type".to_string(), content_type.to_string())],
+         body: Bytes::copy_from_slice(body),
++    }
++}
++
 +/// Build a `POST` (append) request for `path` with extra headers (e.g. `Stream-Key`).
 +fn post_req_with(path: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) -> Req {
 +    let mut headers = vec![("content-type".to_string(), content_type.to_string())];
@@ -27,9 +30,9 @@
 +        query: query.map(|s| s.to_string()),
 +        headers: vec![],
 +        body: Bytes::new(),
-+    }
-+}
-+
+     }
+ }
+ 
 +/// Look up a response header by (lowercase) name.
 +fn resp_header<'a>(resp: &'a crate::api::Resp, name: &str) -> Option<&'a str> {
 +    resp.headers.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
@@ -38,11 +41,10 @@
  /// Create a stream over the REAL HTTP path; assert a 2xx.
  async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
      let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
-@@ -860,7 +891,454 @@
-         st.tail().bytes,
+@@ -861,6 +892,554 @@
          b"survive-me".len() as u64,
          "recovered tail == appended bytes"
-+    );
+     );
 +
 +    let _ = std::fs::remove_dir_all(&dir);
 +}
@@ -86,7 +88,7 @@
 +        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAAAA")),
 +        _ => panic!("expected a Body::Full for a keyed catch-up read"),
 +    }
-+
+ 
 +    let resp_b = handlers::handle(Arc::clone(&h.store), get_req("k/s", Some("key=b"))).await;
 +    assert_eq!(resp_b.status, 200, "keyed catch-up for key=b must 200");
 +    match resp_b.body {
@@ -95,8 +97,8 @@
 +    }
 +
 +    h.crash();
-+    let _ = std::fs::remove_dir_all(&dir);
-+}
+     let _ = std::fs::remove_dir_all(&dir);
+ }
 +
 +/// A `Stream-Key` set on the fork-create request (the fork trio + `stream-key`
 +/// in ONE request) makes the forked stream immediately routable by that key: a
@@ -154,6 +156,107 @@
 +    assert_eq!(resp.status, 200);
 +    match resp.body {
 +        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"01234XYZ")),
++        _ => panic!("expected a Body::Full for a keyed read"),
++    }
++
++    h.crash();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// The multiplexed one-stream-per-namespace fork: `Stream-Forked-From` names a
++/// source KEY within an ALREADY-EXISTING stream (not a whole parent stream by
++/// path) and `Stream-Key` names the new branch key. The branch inherits the
++/// source key's first `Stream-Fork-Sub-Offset` spans (strictly before the cut) —
++/// isolated from other keys interleaved in the same stream — and keyed appends
++/// under the branch extend it. No new stream, no `Stream-Fork-Offset`.
++#[tokio::test]
++async fn e2e_in_stream_keyed_fork_inherits_source_key_prefix() {
++    let _guard = DurabilityGuard::wal();
++    let dir = tmp("in-stream-keyed-fork");
++
++    let h = Harness::boot(&dir, Some(1), 1).unwrap();
++    create_stream(&h.store, "chat", OCTET).await;
++
++    // Two conversations multiplexed into one stream, interleaved. convA has two
++    // appends (two spans); convB is noise that must NOT leak into the fork.
++    for (key, body) in [
++        ("convA", &b"AAAA"[..]),
++        ("convB", &b"ZZZZ"[..]),
++        ("convA", &b"BBBB"[..]),
++    ] {
++        let resp = handlers::handle(
++            Arc::clone(&h.store),
++            post_req_with("chat", OCTET, body, &[("stream-key", key)]),
++        )
++        .await;
++        assert!((200..300).contains(&resp.status), "keyed append got {}", resp.status);
++    }
++
++    // Fork convA into a new branch key, cutting BEFORE convA's 2nd message
++    // (inherit its first 1 span). No new stream — PUT targets the existing
++    // "chat", carrying the source key + branch key + span cut.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        put_req(
++            "chat",
++            OCTET,
++            b"",
++            &[
++                ("stream-forked-from", "convA"),
++                ("stream-key", "forkX"),
++                ("stream-fork-sub-offset", "1"),
++            ],
++        ),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "in-stream fork got {}", resp.status);
++
++    // The branch inherits ONLY convA's first message — no convB noise, no convA
++    // message at/after the cut.
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("chat", Some("key=forkX"))).await;
++    assert_eq!(resp.status, 200, "keyed read of branch must 200");
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAA")),
++        _ => panic!("expected a Body::Full for a keyed read"),
++    }
++
++    // A keyed append under the branch key extends the branch's result.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        post_req_with("chat", OCTET, b"NEW", &[("stream-key", "forkX")]),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "append to branch got {}", resp.status);
++
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("chat", Some("key=forkX"))).await;
++    assert_eq!(resp.status, 200);
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAANEW")),
++        _ => panic!("expected a Body::Full for a keyed read"),
++    }
++
++    // The source key is unmodified by the fork.
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("chat", Some("key=convA"))).await;
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAABBBB")),
++        _ => panic!("expected a Body::Full for a keyed read"),
++    }
++
++    // Omitting the cut inherits ALL of the source key's spans.
++    let resp = handlers::handle(
++        Arc::clone(&h.store),
++        put_req(
++            "chat",
++            OCTET,
++            b"",
++            &[("stream-forked-from", "convA"), ("stream-key", "forkAll")],
++        ),
++    )
++    .await;
++    assert!((200..300).contains(&resp.status), "inherit-all fork got {}", resp.status);
++    let resp = handlers::handle(Arc::clone(&h.store), get_req("chat", Some("key=forkAll"))).await;
++    match resp.body {
++        crate::api::Body::Full(b) => assert_eq!(b, Bytes::from_static(b"AAAABBBB")),
 +        _ => panic!("expected a Body::Full for a keyed read"),
 +    }
 +
@@ -392,7 +495,7 @@
 +        resp_header(&resp1, "stream-next-offset"),
 +        Some(next1.as_str()),
 +        "next-offset must advance to the underlying tail even with no key match"
-     );
++    );
 +    assert_eq!(resp_header(&resp1, "stream-up-to-date"), Some("true"));
 +    assert_eq!(resp_header(&resp1, "cache-control"), Some("no-store"));
 +    assert!(resp_header(&resp1, "etag").is_none(), "keyed live read must not carry an ETag");
@@ -400,7 +503,7 @@
 +        crate::api::Body::Full(b) => assert!(b.is_empty(), "key=a must not see key b's bytes"),
 +        _ => panic!("expected a Body::Full for a keyed long-poll read"),
 +    }
- 
++
 +    // Second long-poll: from the advanced offset (4), parked again.
 +    let store2 = Arc::clone(&h.store);
 +    let poll2 = tokio::spawn(async move {
@@ -430,8 +533,8 @@
 +    }
 +
 +    h.crash();
-     let _ = std::fs::remove_dir_all(&dir);
- }
++    let _ = std::fs::remove_dir_all(&dir);
++}
 +
 +/// A keyed SSE subscriber emits only its key's bytes as `data` events; a wake
 +/// whose new bytes were all another key's still advances `pos` (so the next

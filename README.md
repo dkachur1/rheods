@@ -36,12 +36,13 @@ Both servers in **one Linux container, same kernel**, same `oha` harness
 ## Features
 
 - **`Stream-Key` on append + `?key=` filtered reads** — isolate one conversation; composes with `?offset=`.
-- **`Stream-Key` on fork-create** — set the key in the same request as the fork trio (`Stream-Forked-From` / `-Fork-Offset` / `-Fork-Sub-Offset`); the new branch is `?key=`-routable at birth (its inherited prefix resolves through the fork chain) and later keyed appends route to it — no separate priming append needed.
+- **`Stream-Key` on fork-create** (whole-stream fork) — set the key in the same request as the fork trio (`Stream-Forked-From` = a stream **path**, `-Fork-Offset` / `-Fork-Sub-Offset`); the new branch stream is `?key=`-routable at birth (its inherited byte prefix resolves through the fork chain) and later keyed appends route to it — no separate priming append needed.
+- **In-stream keyed fork** (fork one conversation out of a multiplexed stream) — when `Stream-Forked-From` names a **source KEY** within an already-existing target stream and `Stream-Key` names the new branch key, the branch inherits the source key's rows **strictly before the cut** — `Stream-Fork-Sub-Offset` is the cut, expressed as the source key's span index (count of its appends to inherit; omitted = all). No new stream, no `Stream-Fork-Offset` (the inherited rows already live in this stream); other keys interleaved in the same stream never leak in, and keyed appends under the branch key extend it. This is the shape a one-stream-per-namespace app (`Stream-Key` = conversation) needs to fork/edit a single conversation — a whole-stream fork would inherit every conversation's bytes and can't isolate one by key.
 - **Fast** — coalesced spans + resident-cache-first serving (see [Benchmarks](#benchmarks)).
 - **Durable at ack** — a per-stream `.keys` journal fsyncs before the append is acked; rebuilt on restart. No crash-tail window.
 - **Live** — keyed long-poll + SSE; a reader advances past other keys' data.
 - **Real-client verified** — `@durable-streams/state`'s `createStreamDB` folds a `?key=` read into just that conversation's rows.
-- **102 tests** (87 upstream + keying / fork-keying / persistence / live / journal); patch set verified to apply clean and compile.
+- **103 tests** (87 upstream + keying / fork-keying / in-stream keyed fork / persistence / live / journal); patch set verified to apply clean and compile.
 
 ## How it works
 
